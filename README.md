@@ -7,6 +7,7 @@ a Web Worker via OPFS.
 
 [![standard-readme compliant](https://img.shields.io/badge/readme%20style-standard-brightgreen.svg?style=flat-square)](https://github.com/RichardLitt/standard-readme)
 [![Rust](https://img.shields.io/badge/Rust-1.98.1-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org/)
+[![cargo test](https://img.shields.io/badge/tested_with-cargo%20test-blue.svg?style=flat-square&logo=rust&logoColor=white)](https://doc.rust-lang.org/book/ch11-00-testing.html)
 [![WebAssembly](https://img.shields.io/badge/WebAssembly-654FF0.svg?style=flat-square&logo=webassembly&logoColor=white)](https://webassembly.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-7.0-blue.svg?style=flat-square&logo=typescript)](https://www.typescriptlang.org/)
 [![Vite](https://img.shields.io/badge/Vite-8-646CFF.svg?style=flat-square&logo=vite&logoColor=white)](https://vite.dev/)
