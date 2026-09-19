@@ -3,11 +3,13 @@ resolver = "3"
 members = ["core", "cli", "wasm"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 description = "Markdown to PDF conversion (Rust core, CLI, and WASM)"
+homepage = "https://github.com/amwebexpert/markdown-2-pdf"
 repository = "https://github.com/amwebexpert/markdown-2-pdf"
+keywords = ["markdown", "pdf", "wasm", "webassembly", "opfs"]
 
 [workspace.dependencies]
 pulldown-cmark = "0.13"

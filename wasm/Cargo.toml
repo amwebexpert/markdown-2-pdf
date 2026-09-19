@@ -3,8 +3,11 @@ name = "md2pdf-wasm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description.workspace = true
+description = "Markdown to PDF in the browser (WebAssembly, OPFS, Web Worker)"
+readme = "README.md"
+homepage.workspace = true
 repository.workspace = true
+keywords = ["markdown", "pdf", "wasm", "webassembly", "opfs"]
 
 [lib]
 crate-type = ["cdylib"]
