@@ -12,7 +12,7 @@ use printpdf::{
 };
 
 use crate::error::Md2PdfError;
-use crate::fonts::{text_width_pt, FontSet};
+use crate::fonts::{FontSet, text_width_pt};
 use crate::ir::{Align, Block, Span};
 
 const PAGE_WIDTH_PT: f32 = 612.0; // US Letter, 8.5in
@@ -286,7 +286,17 @@ impl Renderer {
         PAGE_HEIGHT_PT - baseline_from_top
     }
 
-    fn draw_text(&mut self, x: f32, y: f32, text: &str, bold: bool, italic: bool, code: bool, size: f32, color: (f32, f32, f32)) {
+    fn draw_text(
+        &mut self,
+        x: f32,
+        y: f32,
+        text: &str,
+        bold: bool,
+        italic: bool,
+        code: bool,
+        size: f32,
+        color: (f32, f32, f32),
+    ) {
         if text.is_empty() {
             return;
         }
@@ -294,7 +304,12 @@ impl Renderer {
         let (r, g, b) = color;
         self.ops.push(Op::SaveGraphicsState);
         self.ops.push(Op::SetFillColor {
-            col: Color::Rgb(Rgb { r, g, b, icc_profile: None }),
+            col: Color::Rgb(Rgb {
+                r,
+                g,
+                b,
+                icc_profile: None,
+            }),
         });
         self.ops.push(Op::StartTextSection);
         self.ops.push(Op::SetFont {
@@ -312,7 +327,12 @@ impl Renderer {
     }
 
     fn add_link_annotation(&mut self, x: f32, baseline_y: f32, width: f32, size: f32, url: String) {
-        let rect = Rect::from_xywh(Pt(x), Pt(baseline_y - size * 0.2), Pt(width), Pt(size * 1.05));
+        let rect = Rect::from_xywh(
+            Pt(x),
+            Pt(baseline_y - size * 0.2),
+            Pt(width),
+            Pt(size * 1.05),
+        );
         self.ops.push(Op::LinkAnnotation {
             link: LinkAnnotation::new(
                 rect,
@@ -328,8 +348,21 @@ impl Renderer {
         let space_width = text_width_pt(&self.fonts.sans_regular, " ", size);
         let mut x = x0;
         for word in line {
-            let color = if word.link.is_some() { LINK_COLOR } else { BLACK };
-            self.draw_text(x, y, &word.text, word.bold, word.italic, word.code, size, color);
+            let color = if word.link.is_some() {
+                LINK_COLOR
+            } else {
+                BLACK
+            };
+            self.draw_text(
+                x,
+                y,
+                &word.text,
+                word.bold,
+                word.italic,
+                word.code,
+                size,
+                color,
+            );
             if let Some(url) = word.link.clone() {
                 self.add_link_annotation(x, y, word.width, size, url);
             }
@@ -367,13 +400,21 @@ impl Renderer {
                 self.cursor_top += PARAGRAPH_SPACING_AFTER;
             }
             Block::CodeBlock { text } => self.render_code_block(text, x0, max_width),
-            Block::List { ordered, start, items } => self.render_list(*ordered, *start, items, x0),
+            Block::List {
+                ordered,
+                start,
+                items,
+            } => self.render_list(*ordered, *start, items, x0),
             Block::BlockQuote(blocks) => {
                 for b in blocks {
                     self.render_block(b, x0 + BLOCKQUOTE_INDENT);
                 }
             }
-            Block::Table { alignments, header, rows } => self.render_table(alignments, header, rows, x0),
+            Block::Table {
+                alignments,
+                header,
+                rows,
+            } => self.render_table(alignments, header, rows, x0),
             Block::ThematicBreak => self.render_rule(x0, max_width),
         }
     }
@@ -453,13 +494,32 @@ impl Renderer {
         let y = PAGE_HEIGHT_PT - self.cursor_top;
         let (r, g, b) = RULE_GREY;
         self.ops.push(Op::SaveGraphicsState);
-        self.ops.push(Op::SetOutlineColor { col: Color::Rgb(Rgb { r, g, b, icc_profile: None }) });
+        self.ops.push(Op::SetOutlineColor {
+            col: Color::Rgb(Rgb {
+                r,
+                g,
+                b,
+                icc_profile: None,
+            }),
+        });
         self.ops.push(Op::SetOutlineThickness { pt: Pt(1.0) });
         self.ops.push(Op::DrawLine {
             line: Line {
                 points: vec![
-                    LinePoint { p: Point { x: Pt(x0), y: Pt(y) }, bezier: false },
-                    LinePoint { p: Point { x: Pt(x0 + max_width), y: Pt(y) }, bezier: false },
+                    LinePoint {
+                        p: Point {
+                            x: Pt(x0),
+                            y: Pt(y),
+                        },
+                        bezier: false,
+                    },
+                    LinePoint {
+                        p: Point {
+                            x: Pt(x0 + max_width),
+                            y: Pt(y),
+                        },
+                        bezier: false,
+                    },
                 ],
                 is_closed: false,
             },
@@ -468,7 +528,13 @@ impl Renderer {
         self.cursor_top += BODY_LEADING * 0.5;
     }
 
-    fn render_table(&mut self, alignments: &[Align], header: &[Vec<Span>], rows: &[Vec<Vec<Span>>], x0: f32) {
+    fn render_table(
+        &mut self,
+        alignments: &[Align],
+        header: &[Vec<Span>],
+        rows: &[Vec<Vec<Span>>],
+        x0: f32,
+    ) {
         let num_cols = header
             .len()
             .max(rows.iter().map(|r| r.len()).max().unwrap_or(0))
@@ -484,14 +550,17 @@ impl Renderer {
             }
         }
 
-        let (header_lines, header_height) = layout_table_row(&self.fonts, &col_widths, header, true);
+        let (header_lines, header_height) =
+            layout_table_row(&self.fonts, &col_widths, header, true);
         let row_layouts: Vec<(Vec<Vec<Vec<Word>>>, f32)> = rows
             .iter()
             .map(|r| layout_table_row(&self.fonts, &col_widths, r, false))
             .collect();
         let total_height: f32 = header_height + row_layouts.iter().map(|(_, h)| h).sum::<f32>();
 
-        if self.cursor_top > MARGIN_PT && self.cursor_top + total_height > PAGE_HEIGHT_PT - MARGIN_PT {
+        if self.cursor_top > MARGIN_PT
+            && self.cursor_top + total_height > PAGE_HEIGHT_PT - MARGIN_PT
+        {
             self.new_page();
         }
 
@@ -522,8 +591,17 @@ impl Renderer {
         for (i, &w) in col_widths.iter().enumerate() {
             let (r, g, b) = BORDER_GREY;
             self.ops.push(Op::SaveGraphicsState);
-            self.ops.push(Op::SetOutlineColor { col: Color::Rgb(Rgb { r, g, b, icc_profile: None }) });
-            self.ops.push(Op::SetOutlineThickness { pt: Pt(TABLE_BORDER_THICKNESS) });
+            self.ops.push(Op::SetOutlineColor {
+                col: Color::Rgb(Rgb {
+                    r,
+                    g,
+                    b,
+                    icc_profile: None,
+                }),
+            });
+            self.ops.push(Op::SetOutlineThickness {
+                pt: Pt(TABLE_BORDER_THICKNESS),
+            });
             self.ops.push(Op::DrawRectangle {
                 rectangle: Rect {
                     x: Pt(x),
@@ -548,7 +626,9 @@ impl Renderer {
                         Align::Center => text_x0 + extra / 2.0,
                         Align::Left | Align::None => text_x0,
                     };
-                    let baseline_y = row_top_pdf_y - TABLE_CELL_PADDING - (li as f32 + BASELINE_RATIO) * TABLE_ROW_LEADING;
+                    let baseline_y = row_top_pdf_y
+                        - TABLE_CELL_PADDING
+                        - (li as f32 + BASELINE_RATIO) * TABLE_ROW_LEADING;
                     self.render_line(line, start_x, baseline_y, TABLE_FONT_SIZE);
                 }
             }

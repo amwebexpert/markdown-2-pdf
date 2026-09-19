@@ -40,6 +40,10 @@ fn convert(input: PathBuf, output: Option<PathBuf>) -> Result<()> {
     std::fs::write(&output, pdf_bytes)
         .with_context(|| format!("failed to write {}", output.display()))?;
 
-    println!("Wrote {} ({page_count} page{})", output.display(), if page_count == 1 { "" } else { "s" });
+    println!(
+        "Wrote {} ({page_count} page{})",
+        output.display(),
+        if page_count == 1 { "" } else { "s" }
+    );
     Ok(())
 }

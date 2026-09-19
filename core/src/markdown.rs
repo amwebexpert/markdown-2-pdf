@@ -53,7 +53,10 @@ pub fn parse(input: &str) -> Vec<Block> {
                 // Container, so a Paragraph opened implicitly by `push_text`
                 // must be closed before any other block-level tag can nest
                 // — except another inline container, which belongs inside it.
-                if !matches!(tag, Tag::Emphasis | Tag::Strong | Tag::Link { .. } | Tag::Image { .. }) {
+                if !matches!(
+                    tag,
+                    Tag::Emphasis | Tag::Strong | Tag::Link { .. } | Tag::Image { .. }
+                ) {
                     flush_dangling_paragraph(&mut stack);
                 }
                 start_tag(&mut stack, tag)
@@ -139,7 +142,13 @@ fn end_tag(stack: &mut Vec<Frame>, tag_end: TagEnd) {
         }
         TagEnd::Heading(level) => {
             if let Some(Frame::Heading(spans)) = stack.pop() {
-                push_block(stack, Block::Heading { level: heading_level(level), spans });
+                push_block(
+                    stack,
+                    Block::Heading {
+                        level: heading_level(level),
+                        spans,
+                    },
+                );
             }
         }
         TagEnd::BlockQuote(_) => {
@@ -153,8 +162,20 @@ fn end_tag(stack: &mut Vec<Frame>, tag_end: TagEnd) {
             }
         }
         TagEnd::List(_) => {
-            if let Some(Frame::List { ordered, start, items }) = stack.pop() {
-                push_block(stack, Block::List { ordered, start, items });
+            if let Some(Frame::List {
+                ordered,
+                start,
+                items,
+            }) = stack.pop()
+            {
+                push_block(
+                    stack,
+                    Block::List {
+                        ordered,
+                        start,
+                        items,
+                    },
+                );
             }
         }
         TagEnd::Item => {
@@ -165,8 +186,20 @@ fn end_tag(stack: &mut Vec<Frame>, tag_end: TagEnd) {
             }
         }
         TagEnd::Table => {
-            if let Some(Frame::Table { alignments, header, rows }) = stack.pop() {
-                push_block(stack, Block::Table { alignments, header, rows });
+            if let Some(Frame::Table {
+                alignments,
+                header,
+                rows,
+            }) = stack.pop()
+            {
+                push_block(
+                    stack,
+                    Block::Table {
+                        alignments,
+                        header,
+                        rows,
+                    },
+                );
             }
         }
         TagEnd::TableRow => {

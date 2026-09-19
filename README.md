@@ -17,11 +17,11 @@ a Web Worker via OPFS.
   - [Layout](#layout)
   - [Prerequisites](#prerequisites)
   - [Just (task runner)](#just-task-runner)
-  - [Build the CLI](#build-the-cli)
-  - [Build the WASM module](#build-the-wasm-module)
+  - [CLI](#cli)
+  - [WASM module](#wasm-module)
   - [Bump versions](#bump-versions)
   - [Publish the WASM npm package](#publish-the-wasm-npm-package)
-  - [Run the demo](#run-the-demo)
+  - [Demo](#demo)
   - [Known limitations (v1)](#known-limitations-v1)
 
 ## Layout
@@ -42,44 +42,38 @@ a Web Worker via OPFS.
   the `wasm32-unknown-unknown` target automatically on first build.
 - [`wasm-pack`](https://rustwasm.github.io/wasm-pack/) — `cargo install wasm-pack`.
 - [`bun`](https://bun.sh) — for the demo page only.
-- [`just`](https://github.com/casey/just) (optional) — `cargo install just` or `brew install just`; wraps the commands below.
+- [`just`](https://github.com/casey/just) — `cargo install just` or `brew install just`; all build and dev tasks go through the [`justfile`](justfile).
 
 ## Just (task runner)
 
-[`justfile`](justfile) at the repo root. Run `just` to list recipes.
+From the repo root, run `just` to list recipes. Common entry points:
 
 | Recipe | Purpose |
 | ------ | ------- |
-| `build-cli` / `build-cli-release` | Build the `md2pdf` binary (debug / release). |
-| `build-wasm` | `wasm-pack build wasm --target web` → `wasm/pkg/`. |
-| `build-wasm-npm` | Same with `--scope amwebexpert` for npm publish. |
-| `convert INPUT` | `cargo run -p md2pdf -- convert …` (optional extra flags after the path). |
+| `build-cli` / `build-cli-release` | Native `md2pdf` binary (debug / release). |
+| `build-wasm` | Browser WASM package in `wasm/pkg/`. |
+| `build-wasm-npm` | Scoped WASM build for npm (`@amwebexpert/md2pdf-wasm`). |
+| `convert INPUT` | Convert one Markdown file (optional flags after the path, e.g. `-o out.pdf`). |
 | `examples` | Regenerate PDFs for every `cli/examples/*.md`. |
-| `demo` | Build WASM, `bun install`, Vite dev server. |
-| `demo-build` | WASM + production build of `demo/dist/`. |
-| `check` / `clippy` / `fmt` / `fmt-check` | Workspace `cargo check`, clippy, format. |
-| `publish-npm` | Scoped WASM build + `npm publish --access public` in `wasm/pkg/`. |
-| `clean` | `cargo clean` and remove `wasm/pkg/`, demo `node_modules` / `dist/`. |
+| `demo` | WASM build, demo deps, Vite dev server. |
+| `demo-build` | WASM build + production static site in `demo/dist/`. |
+| `check` / `clippy` / `fmt` / `fmt-check` | Workspace check, lint, format. |
+| `publish-npm` | Scoped WASM build and npm publish. |
+| `clean` | Rust target artifacts, `wasm/pkg/`, demo `node_modules` / `dist/`. |
 
-## Build the CLI
+## CLI
 
-```sh
-cargo build -p md2pdf
-cargo run -p md2pdf -- convert cli/examples/kitchen-sink.md
-# -o is optional; defaults to the input path with a .pdf extension
-cargo run -p md2pdf -- convert cli/examples/kitchen-sink.md -o /tmp/out.pdf
-```
+- Build: `just build-cli` (or `just build-cli-release`).
+- Convert: `just convert cli/examples/kitchen-sink.md` — output defaults to the input path with a `.pdf` extension; pass `-o /path/out.pdf` after the input path when needed.
+- Regenerate all sample PDFs: `just examples`.
 
-See [`cli/examples/`](cli/examples/) for sample inputs (`simple.md`, `kitchen-sink.md` — every
+See [`cli/examples/`](cli/examples/) for inputs (`simple.md`, `kitchen-sink.md` — every
 supported construct, `nested-and-long.md` — nested lists and multi-page
-pagination). Regenerate `.pdf` files with the `convert` commands above for manual comparison
-(example PDFs are not committed; see [`.gitignore`](.gitignore)).
+pagination). Example PDFs are not committed; see [`.gitignore`](.gitignore).
 
-## Build the WASM module
+## WASM module
 
-```sh
-wasm-pack build wasm --target web
-```
+- Build: `just build-wasm`.
 
 Produces `wasm/pkg/` (gitignored): `md2pdf_wasm.js`, `md2pdf_wasm_bg.wasm`,
 and a `.d.ts`. The demo imports this directly.
@@ -99,7 +93,7 @@ All Rust crates share one semver via the workspace:
 | ----------------- | ------------- | --------------------------------------------------------------------- |
 | [`core/`](core/)  | `md2pdf-core` | [`Cargo.toml`](Cargo.toml) → `[workspace.package] version`            |
 | [`cli/`](cli/)    | `md2pdf`      | same                                                                  |
-| [`wasm/`](wasm/)  | `md2pdf-wasm` | same (becomes npm `@amwebexpert/md2pdf-wasm` after `wasm-pack build`) |
+| [`wasm/`](wasm/)  | `md2pdf-wasm` | same (becomes npm `@amwebexpert/md2pdf-wasm` after `just build-wasm`) |
 
 Each member crate sets `version.workspace = true` in its own `Cargo.toml`; do **not**
 duplicate a `version = "…"` line there unless you intentionally opt out of the workspace
@@ -109,9 +103,7 @@ duplicate a `version = "…"` line there unless you intentionally opt out of the
 
 1. Edit `[workspace.package] version` in the repo-root [`Cargo.toml`](Cargo.toml)
    (e.g. `0.1.1` → `0.1.2`). Use [semver](https://semver.org/) — breaking API or output changes → major; backward-compatible features → minor; fixes → patch.
-2. Rebuild what you ship: `cargo build -p md2pdf` for the CLI,
-   `wasm-pack build wasm --target web` for the browser module (regenerates `wasm/pkg/package.json`
-   with the new version).
+2. Rebuild what you ship: `just build-cli` and `just build-wasm` (regenerates `wasm/pkg/package.json` with the new version).
 3. Commit [`Cargo.toml`](Cargo.toml) and [`Cargo.lock`](Cargo.lock) together with the release tag or PR.
 
 The [`demo/`](demo/) app is private (`demo/package.json` has its own `version`); bump it only if you care about local bookkeeping — it is not published.
@@ -119,12 +111,13 @@ The [`demo/`](demo/) app is private (`demo/package.json` has its own `version`);
 ## Publish the WASM npm package
 
 `wasm-pack` writes an npm package under `wasm/pkg/` (gitignored). The Rust crate
-is `md2pdf-wasm`; we publish to npm as **`@amwebexpert/md2pdf-wasm`** via
-`--scope amwebexpert` (you must control that npm scope). [Bump versions](#bump-versions)
-first, then rebuild and publish.
+is `md2pdf-wasm`; we publish to npm as **`@amwebexpert/md2pdf-wasm`** (you must control the `amwebexpert` npm scope). [Bump versions](#bump-versions) first, then:
 
-**Prerequisites:** an [npmjs.com](https://www.npmjs.com/) account and
-[`npm login`](https://docs.npmjs.com/cli/v11/commands/npm-login).
+```sh
+just publish-npm
+```
+
+Requires an [npmjs.com](https://www.npmjs.com/) account and [`npm login`](https://docs.npmjs.com/cli/v11/commands/npm-login).
 
 [`wasm-pack build`](https://rustwasm.github.io/docs/wasm-pack/commands/build.html)
 generates `package.json` from the wasm crate's `Cargo.toml` and copies
@@ -132,30 +125,20 @@ generates `package.json` from the wasm crate's `Cargo.toml` and copies
 package page; `description`, `homepage`, `repository`, and `keywords` in
 [`wasm/Cargo.toml`](wasm/Cargo.toml) fill the sidebar (edit [`wasm/README.md`](wasm/README.md) for npm-facing docs).
 
-```sh
-wasm-pack build wasm --target web --scope amwebexpert
-cd wasm/pkg && npm publish --access public
-```
-
 Consumers install with `npm install @amwebexpert/md2pdf-wasm`, import `init` and `convert`,
 and run the module in a **Web Worker** with **OPFS** (same constraints as the
 demo — see [`demo/src/main.ts`](demo/src/main.ts) and [`demo/src/worker.ts`](demo/src/worker.ts)).
 
-## Run the demo
+## Demo
 
-Build the WASM module first ([Build the WASM module](#build-the-wasm-module)). From the repo root:
-
-```sh
-wasm-pack build wasm --target web
-cd demo
-bun install
-bun start
-```
+From the repo root: `just demo` (builds WASM and starts Vite).
 
 Open the printed local URL. Edit the Markdown, click **Convert to PDF** — it
 writes the text to OPFS, runs the WASM module in a Worker (sync OPFS access
 handle), reads the resulting PDF back from OPFS, and offers it as a download.
 No large buffer is copied across the JS/WASM boundary directly.
+
+Production static output: `just demo-build`.
 
 ## Known limitations (v1)
 
@@ -166,6 +149,6 @@ No large buffer is copied across the JS/WASM boundary directly.
   breaks (horizontal rules). Anything else CommonMark/GFM can emit (images,
   strikethrough, task lists, …) falls back to plain text rather than failing
   the conversion.
-- No automated tests — verify manually via the CLI examples above or the demo.
+- No automated tests — verify manually with `just examples` or `just demo`.
 - Fonts are embedded unsubsetted; OPFS paths are flat filenames (no
   subdirectories).

@@ -28,10 +28,21 @@ pub enum Align {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
-    Heading { level: u8, spans: Vec<Span> },
-    Paragraph { spans: Vec<Span> },
-    CodeBlock { text: String },
-    List { ordered: bool, start: u64, items: Vec<Vec<Block>> },
+    Heading {
+        level: u8,
+        spans: Vec<Span>,
+    },
+    Paragraph {
+        spans: Vec<Span>,
+    },
+    CodeBlock {
+        text: String,
+    },
+    List {
+        ordered: bool,
+        start: u64,
+        items: Vec<Vec<Block>>,
+    },
     BlockQuote(Vec<Block>),
     Table {
         alignments: Vec<Align>,

@@ -8,8 +8,8 @@
 //! flush/close calls on the acquired handle are synchronous. So `convert`
 //! is `async`, but the file I/O itself is a direct, non-awaited call.
 
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     DedicatedWorkerGlobalScope, FileSystemDirectoryHandle, FileSystemFileHandle,
@@ -28,10 +28,9 @@ pub fn init() {
 pub async fn convert(input_path: &str) -> Result<String, JsValue> {
     let root = opfs_root().await?;
 
-    let input_handle: FileSystemFileHandle =
-        JsFuture::from(root.get_file_handle(input_path))
-            .await?
-            .unchecked_into();
+    let input_handle: FileSystemFileHandle = JsFuture::from(root.get_file_handle(input_path))
+        .await?
+        .unchecked_into();
     let markdown = read_text_file(&input_handle).await?;
 
     let (pdf_bytes, _page_count) =
@@ -60,10 +59,9 @@ async fn opfs_root() -> Result<FileSystemDirectoryHandle, JsValue> {
 }
 
 async fn read_text_file(handle: &FileSystemFileHandle) -> Result<String, JsValue> {
-    let access: FileSystemSyncAccessHandle =
-        JsFuture::from(handle.create_sync_access_handle())
-            .await?
-            .unchecked_into();
+    let access: FileSystemSyncAccessHandle = JsFuture::from(handle.create_sync_access_handle())
+        .await?
+        .unchecked_into();
     let size = access.get_size()? as usize;
     let mut buf = vec![0u8; size];
     access.read_with_u8_array(&mut buf)?;
@@ -72,14 +70,12 @@ async fn read_text_file(handle: &FileSystemFileHandle) -> Result<String, JsValue
 }
 
 async fn write_bytes_file(handle: &FileSystemFileHandle, bytes: &[u8]) -> Result<(), JsValue> {
-    let access: FileSystemSyncAccessHandle =
-        JsFuture::from(handle.create_sync_access_handle())
-            .await?
-            .unchecked_into();
+    let access: FileSystemSyncAccessHandle = JsFuture::from(handle.create_sync_access_handle())
+        .await?
+        .unchecked_into();
     access.truncate_with_f64(bytes.len() as f64)?;
     access.write_with_u8_array(bytes)?;
     access.flush()?;
     access.close();
     Ok(())
 }
-
