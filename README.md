@@ -18,6 +18,7 @@ a Web Worker via OPFS.
   - [Prerequisites](#prerequisites)
   - [Build the CLI](#build-the-cli)
   - [Build the WASM module](#build-the-wasm-module)
+  - [Bump versions](#bump-versions)
   - [Publish the WASM npm package](#publish-the-wasm-npm-package)
   - [Run the demo](#run-the-demo)
   - [Known limitations (v1)](#known-limitations-v1)
@@ -71,13 +72,37 @@ friends). These extra exports show up in `md2pdf_wasm.d.ts` alongside our own
 They also add to the ~6MB binary size, on top of the embedded Liberation
 fonts (~2.7MB raw, unsubsetted — see [`core/src/fonts.rs`](core/src/fonts.rs)).
 
+## Bump versions
+
+All Rust crates share one semver via the workspace:
+
+| Crate (directory) | Package name  | Version source                                                        |
+| ----------------- | ------------- | --------------------------------------------------------------------- |
+| [`core/`](core/)  | `md2pdf-core` | [`Cargo.toml`](Cargo.toml) → `[workspace.package] version`            |
+| [`cli/`](cli/)    | `md2pdf`      | same                                                                  |
+| [`wasm/`](wasm/)  | `md2pdf-wasm` | same (becomes npm `@amwebexpert/md2pdf-wasm` after `wasm-pack build`) |
+
+Each member crate sets `version.workspace = true` in its own `Cargo.toml`; do **not**
+duplicate a `version = "…"` line there unless you intentionally opt out of the workspace
+(default is one bump for everyone).
+
+**Release checklist:**
+
+1. Edit `[workspace.package] version` in the repo-root [`Cargo.toml`](Cargo.toml)
+   (e.g. `0.1.1` → `0.1.2`). Use [semver](https://semver.org/) — breaking API or output changes → major; backward-compatible features → minor; fixes → patch.
+2. Rebuild what you ship: `cargo build -p md2pdf` for the CLI,
+   `wasm-pack build wasm --target web` for the browser module (regenerates `wasm/pkg/package.json`
+   with the new version).
+3. Commit [`Cargo.toml`](Cargo.toml) and [`Cargo.lock`](Cargo.lock) together with the release tag or PR.
+
+The [`demo/`](demo/) app is private (`demo/package.json` has its own `version`); bump it only if you care about local bookkeeping — it is not published.
+
 ## Publish the WASM npm package
 
 `wasm-pack` writes an npm package under `wasm/pkg/` (gitignored). The Rust crate
 is `md2pdf-wasm`; we publish to npm as **`@amwebexpert/md2pdf-wasm`** via
-`--scope amwebexpert` (you must control that npm scope). Bump
-`[workspace.package] version` in the repo-root [`Cargo.toml`](Cargo.toml) before each release,
-then rebuild.
+`--scope amwebexpert` (you must control that npm scope). [Bump versions](#bump-versions)
+first, then rebuild and publish.
 
 **Prerequisites:** an [npmjs.com](https://www.npmjs.com/) account and
 [`npm login`](https://docs.npmjs.com/cli/v11/commands/npm-login).
