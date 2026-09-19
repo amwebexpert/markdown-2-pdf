@@ -122,17 +122,18 @@ fn line_width(line: &[Word], space_width: f32) -> f32 {
     words + space_width * (line.len() as f32 - 1.0)
 }
 
-/// Hard character-wrap (no word boundaries) for monospace code lines, so a
-/// long line overflows onto extra lines instead of running off the page edge.
-fn wrap_monospace(fonts: &FontSet, line: &str, size: f32, max_width: f32) -> Vec<String> {
-    if line.is_empty() {
-        return vec![String::new()];
-    }
-    let font = fonts.resolve(false, false, true);
+/// Hard character-wrap (no word boundaries), so a long run of text overflows
+/// onto extra lines instead of running off the page edge.
+fn hard_wrap_chars(
+    font: &printpdf::ParsedFont,
+    text: &str,
+    size: f32,
+    max_width: f32,
+) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
     let mut current_width = 0.0f32;
-    for ch in line.chars() {
+    for ch in text.chars() {
         let w = text_width_pt(font, &ch.to_string(), size);
         if current_width + w > max_width && !current.is_empty() {
             out.push(std::mem::take(&mut current));
@@ -143,6 +144,48 @@ fn wrap_monospace(fonts: &FontSet, line: &str, size: f32, max_width: f32) -> Vec
     }
     if !current.is_empty() || out.is_empty() {
         out.push(current);
+    }
+    out
+}
+
+/// Hard character-wrap for monospace code lines. See `hard_wrap_chars`.
+fn wrap_monospace(fonts: &FontSet, line: &str, size: f32, max_width: f32) -> Vec<String> {
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+    let font = fonts.resolve(false, false, true);
+    hard_wrap_chars(font, line, size, max_width)
+}
+
+/// Replaces any `Token::Word` wider than `max_width` on its own (a single
+/// unbreakable token, e.g. a path or URL with no whitespace) with several
+/// narrower `Token::Word`s hard-split at the character level, so `wrap_lines`
+/// naturally spreads it across lines instead of letting it overflow the page.
+fn split_oversized_words(
+    tokens: Vec<Token>,
+    fonts: &FontSet,
+    size: f32,
+    max_width: f32,
+) -> Vec<Token> {
+    let mut out = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        match token {
+            Token::Word(w) if w.width > max_width => {
+                let font = fonts.resolve(w.bold, w.italic, w.code);
+                for chunk in hard_wrap_chars(font, &w.text, size, max_width) {
+                    let width = text_width_pt(font, &chunk, size);
+                    out.push(Token::Word(Word {
+                        text: chunk,
+                        bold: w.bold,
+                        italic: w.italic,
+                        code: w.code,
+                        link: w.link.clone(),
+                        width,
+                    }));
+                }
+            }
+            other => out.push(other),
+        }
     }
     out
 }
@@ -197,6 +240,7 @@ fn layout_table_row(
         let spans = cells.get(i).cloned().unwrap_or_default();
         let content_width = (col_width - TABLE_CELL_PADDING * 2.0).max(1.0);
         let tokens = tokenize(&spans, fonts, TABLE_FONT_SIZE, force_bold);
+        let tokens = split_oversized_words(tokens, fonts, TABLE_FONT_SIZE, content_width);
         cell_lines.push(wrap_lines(tokens, content_width, space_width));
     }
     let line_count = cell_lines.iter().map(|l| l.len().max(1)).max().unwrap_or(1);
@@ -409,6 +453,7 @@ impl Renderer {
     ) -> Vec<Vec<Word>> {
         let space_width = text_width_pt(space_font, " ", size);
         let tokens = tokenize(spans, &self.fonts, size, force_bold);
+        let tokens = split_oversized_words(tokens, &self.fonts, size, max_width);
         wrap_lines(tokens, max_width, space_width)
     }
 
@@ -800,6 +845,39 @@ mod tests {
         let fonts = FontSet::load().unwrap();
         let lines = wrap_monospace(&fonts, "hi", 10.0, 1000.0);
         assert_eq!(lines, vec!["hi".to_string()]);
+    }
+
+    #[test]
+    fn hard_wrap_chars_splits_long_text_within_max_width() {
+        let fonts = FontSet::load().unwrap();
+        let font = fonts.resolve(false, false, false);
+        let text = "src/features/Configuration/report_templates/ReportTemplateEditor.tsx";
+        let max_width = 100.0;
+        let chunks = hard_wrap_chars(font, text, 24.0, max_width);
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.concat(), text);
+        for chunk in &chunks {
+            assert!(text_width_pt(font, chunk, 24.0) <= max_width);
+        }
+    }
+
+    #[test]
+    fn long_unbreakable_heading_token_wraps_instead_of_overflowing() {
+        let renderer = Renderer::new().unwrap();
+        let long_token = "src/features/Configuration/report_templates/ReportTemplateEditor.tsx";
+        let max_width = 200.0;
+        let lines = renderer.wrap_spans_to_lines(
+            &[Span::plain(long_token)],
+            max_width,
+            HEADING_SIZES[0],
+            true,
+            &renderer.fonts.sans_bold,
+        );
+        assert!(lines.len() > 1);
+        let space_width = text_width_pt(&renderer.fonts.sans_bold, " ", HEADING_SIZES[0]);
+        for line in &lines {
+            assert!(line_width(line, space_width) <= max_width);
+        }
     }
 
     #[test]
