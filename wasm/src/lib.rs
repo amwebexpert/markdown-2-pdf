@@ -37,7 +37,9 @@ pub async fn convert(input_path: &str) -> Result<String, JsValue> {
     let (pdf_bytes, _page_count) =
         md2pdf_core::convert(&markdown).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-    let output_path = derive_output_path(input_path);
+    let output_path = md2pdf_core::default_pdf_output_path(input_path)
+        .to_string_lossy()
+        .into_owned();
     let options = FileSystemGetFileOptions::new();
     options.set_create(true);
     let output_handle: FileSystemFileHandle =
@@ -81,9 +83,3 @@ async fn write_bytes_file(handle: &FileSystemFileHandle, bytes: &[u8]) -> Result
     Ok(())
 }
 
-fn derive_output_path(input_path: &str) -> String {
-    match input_path.rsplit_once('.') {
-        Some((stem, _ext)) => format!("{stem}.pdf"),
-        None => format!("{input_path}.pdf"),
-    }
-}

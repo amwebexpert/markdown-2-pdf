@@ -2,7 +2,9 @@
 name = "md2pdf-wasm"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file = "../LICENSE"
+description.workspace = true
+repository.workspace = true
 
 [lib]
 crate-type = ["cdylib"]

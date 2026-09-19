@@ -29,7 +29,7 @@ fn main() -> Result<()> {
 }
 
 fn convert(input: PathBuf, output: Option<PathBuf>) -> Result<()> {
-    let output = output.unwrap_or_else(|| input.with_extension("pdf"));
+    let output = output.unwrap_or_else(|| md2pdf_core::default_pdf_output_path(&input));
 
     let markdown = std::fs::read_to_string(&input)
         .with_context(|| format!("failed to read {}", input.display()))?;

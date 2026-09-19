@@ -11,6 +11,14 @@ a Web Worker via OPFS.
 [![Bun](https://img.shields.io/badge/Bun-000000.svg?style=flat-square&logo=bun)](https://bun.sh/)
 [![wasm-pack](https://img.shields.io/badge/wasm--pack-Rust%20Wasm-654FF0.svg?style=flat-square&logo=webassembly&logoColor=white)](https://rustwasm.github.io/wasm-pack/)
 
+- [md2pdf](#md2pdf)
+  - [Layout](#layout)
+  - [Prerequisites](#prerequisites)
+  - [Build the CLI](#build-the-cli)
+  - [Build the WASM module](#build-the-wasm-module)
+  - [Run the demo](#run-the-demo)
+  - [Known limitations (v1)](#known-limitations-v1)
+
 ## Layout
 
 - `core/` — pure conversion logic (Markdown parsing via `pulldown-cmark`,
@@ -76,10 +84,11 @@ No large buffer is copied across the JS/WASM boundary directly.
 
 - Markdown support: headings, paragraphs, bold/italic, ordered/unordered
   lists (incl. nested), code blocks (no syntax highlighting), links
-  (rendered as text + a real clickable PDF annotation), and GFM tables
-  (content-sized columns, alignment). Anything else CommonMark/GFM can emit
-  (images, blockquotes, thematic breaks, strikethrough, task lists) falls
-  back to plain text rather than failing the conversion.
+  (rendered as text + a real clickable PDF annotation), GFM tables
+  (content-sized columns, alignment), blockquotes (indented), and thematic
+  breaks (horizontal rules). Anything else CommonMark/GFM can emit (images,
+  strikethrough, task lists, …) falls back to plain text rather than failing
+  the conversion.
 - No automated tests — verify manually via the CLI examples above or the demo.
 - Fonts are embedded unsubsetted; OPFS paths are flat filenames (no
   subdirectories).

@@ -6,6 +6,8 @@ members = ["core", "cli", "wasm"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "Markdown to PDF conversion (Rust core, CLI, and WASM)"
+repository = "https://github.com/amwebexpert/markdown-2-pdf"
 
 [workspace.dependencies]
 pulldown-cmark = "0.13"
