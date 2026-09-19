@@ -381,41 +381,58 @@ impl Renderer {
     fn render_block(&mut self, block: &Block, x0: f32) {
         let max_width = (PAGE_WIDTH_PT - MARGIN_PT - x0).max(1.0);
         match block {
-            Block::Heading { level, spans } => {
-                let idx = (*level as usize).saturating_sub(1).min(5);
-                let size = HEADING_SIZES[idx];
-                let leading = size * HEADING_LEADING_FACTOR;
-                self.cursor_top += HEADING_SPACING_BEFORE;
-                let space_width = text_width_pt(&self.fonts.sans_bold, " ", size);
-                let tokens = tokenize(spans, &self.fonts, size, true);
-                let lines = wrap_lines(tokens, max_width, space_width);
-                self.render_lines(&lines, x0, size, leading);
-                self.cursor_top += HEADING_SPACING_AFTER;
-            }
-            Block::Paragraph { spans } => {
-                let space_width = text_width_pt(&self.fonts.sans_regular, " ", BODY_SIZE);
-                let tokens = tokenize(spans, &self.fonts, BODY_SIZE, false);
-                let lines = wrap_lines(tokens, max_width, space_width);
-                self.render_lines(&lines, x0, BODY_SIZE, BODY_LEADING);
-                self.cursor_top += PARAGRAPH_SPACING_AFTER;
-            }
+            Block::Heading { level, spans } => self.render_heading(*level, spans, x0, max_width),
+            Block::Paragraph { spans } => self.render_paragraph(spans, x0, max_width),
             Block::CodeBlock { text } => self.render_code_block(text, x0, max_width),
             Block::List {
                 ordered,
                 start,
                 items,
             } => self.render_list(*ordered, *start, items, x0),
-            Block::BlockQuote(blocks) => {
-                for b in blocks {
-                    self.render_block(b, x0 + BLOCKQUOTE_INDENT);
-                }
-            }
+            Block::BlockQuote(blocks) => self.render_blockquote(blocks, x0),
             Block::Table {
                 alignments,
                 header,
                 rows,
             } => self.render_table(alignments, header, rows, x0),
             Block::ThematicBreak => self.render_rule(x0, max_width),
+        }
+    }
+
+    fn wrap_spans_to_lines(
+        &self,
+        spans: &[Span],
+        max_width: f32,
+        size: f32,
+        force_bold: bool,
+        space_font: &printpdf::ParsedFont,
+    ) -> Vec<Vec<Word>> {
+        let space_width = text_width_pt(space_font, " ", size);
+        let tokens = tokenize(spans, &self.fonts, size, force_bold);
+        wrap_lines(tokens, max_width, space_width)
+    }
+
+    fn render_heading(&mut self, level: u8, spans: &[Span], x0: f32, max_width: f32) {
+        let idx = (level as usize).saturating_sub(1).min(5);
+        let size = HEADING_SIZES[idx];
+        let leading = size * HEADING_LEADING_FACTOR;
+        self.cursor_top += HEADING_SPACING_BEFORE;
+        let lines = self.wrap_spans_to_lines(spans, max_width, size, true, &self.fonts.sans_bold);
+        self.render_lines(&lines, x0, size, leading);
+        self.cursor_top += HEADING_SPACING_AFTER;
+    }
+
+    fn render_paragraph(&mut self, spans: &[Span], x0: f32, max_width: f32) {
+        let lines =
+            self.wrap_spans_to_lines(spans, max_width, BODY_SIZE, false, &self.fonts.sans_regular);
+        self.render_lines(&lines, x0, BODY_SIZE, BODY_LEADING);
+        self.cursor_top += PARAGRAPH_SPACING_AFTER;
+    }
+
+    fn render_blockquote(&mut self, blocks: &[Block], x0: f32) {
+        let quote_x = x0 + BLOCKQUOTE_INDENT;
+        for block in blocks {
+            self.render_block(block, quote_x);
         }
     }
 
@@ -437,54 +454,114 @@ impl Renderer {
         self.cursor_top += PARAGRAPH_SPACING_AFTER;
     }
 
+    fn list_marker(ordered: bool, start: u64, index: usize) -> String {
+        if ordered {
+            format!("{}.", start + index as u64)
+        } else {
+            "\u{2022}".to_string()
+        }
+    }
+
+    fn reserve_list_line_baseline(&mut self) -> f32 {
+        self.ensure_space(BODY_LEADING);
+        self.next_baseline(BODY_LEADING)
+    }
+
+    fn draw_list_marker(&mut self, indent: f32, y: f32, marker: &str) {
+        self.draw_text(indent, y, marker, false, false, false, BODY_SIZE, BLACK);
+    }
+
+    fn render_list_continuation_lines(
+        &mut self,
+        lines: impl IntoIterator<Item = impl AsRef<[Word]>>,
+        content_x: f32,
+    ) {
+        for line in lines {
+            let y = self.reserve_list_line_baseline();
+            self.render_line(line.as_ref(), content_x, y, BODY_SIZE);
+        }
+    }
+
+    fn render_list_item_blocks(&mut self, blocks: &[Block], content_x: f32) {
+        for block in blocks {
+            self.render_block(block, content_x);
+        }
+    }
+
+    fn render_list_item_paragraph_lead(
+        &mut self,
+        spans: &[Span],
+        rest: &[Block],
+        indent: f32,
+        content_x: f32,
+        max_width: f32,
+        marker: &str,
+    ) {
+        let lines = self.wrap_spans_to_lines(
+            spans,
+            max_width,
+            BODY_SIZE,
+            false,
+            &self.fonts.sans_regular,
+        );
+        let mut lines_iter = lines.iter();
+        if let Some(first_line) = lines_iter.next() {
+            let y = self.reserve_list_line_baseline();
+            self.draw_list_marker(indent, y, marker);
+            self.render_line(first_line, content_x, y, BODY_SIZE);
+        }
+        self.render_list_continuation_lines(lines_iter, content_x);
+        self.cursor_top += PARAGRAPH_SPACING_AFTER * 0.4;
+        self.render_list_item_blocks(rest, content_x);
+    }
+
+    fn render_list_item_block_lead(
+        &mut self,
+        first: &Block,
+        rest: &[Block],
+        indent: f32,
+        content_x: f32,
+        marker: &str,
+    ) {
+        let y = self.reserve_list_line_baseline();
+        self.draw_list_marker(indent, y, marker);
+        self.render_block(first, content_x);
+        self.render_list_item_blocks(rest, content_x);
+    }
+
+    fn render_list_item_marker_only(&mut self, indent: f32, marker: &str) {
+        let y = self.reserve_list_line_baseline();
+        self.draw_list_marker(indent, y, marker);
+    }
+
+    fn render_list_item(
+        &mut self,
+        item_blocks: &[Block],
+        indent: f32,
+        content_x: f32,
+        max_width: f32,
+        marker: &str,
+    ) {
+        match item_blocks.split_first() {
+            Some((Block::Paragraph { spans }, rest)) => {
+                self.render_list_item_paragraph_lead(
+                    spans, rest, indent, content_x, max_width, marker,
+                );
+            }
+            Some((first, rest)) => {
+                self.render_list_item_block_lead(first, rest, indent, content_x, marker);
+            }
+            None => self.render_list_item_marker_only(indent, marker),
+        }
+    }
+
     fn render_list(&mut self, ordered: bool, start: u64, items: &[Vec<Block>], indent: f32) {
         let content_x = indent + LIST_INDENT;
         let max_width = (PAGE_WIDTH_PT - MARGIN_PT - content_x).max(1.0);
-        let space_width = text_width_pt(&self.fonts.sans_regular, " ", BODY_SIZE);
 
         for (i, item_blocks) in items.iter().enumerate() {
-            let marker = if ordered {
-                format!("{}.", start + i as u64)
-            } else {
-                "\u{2022}".to_string()
-            };
-
-            match item_blocks.split_first() {
-                Some((Block::Paragraph { spans }, rest)) => {
-                    let tokens = tokenize(spans, &self.fonts, BODY_SIZE, false);
-                    let lines = wrap_lines(tokens, max_width, space_width);
-                    let mut lines_iter = lines.iter();
-                    if let Some(first_line) = lines_iter.next() {
-                        self.ensure_space(BODY_LEADING);
-                        let y = self.next_baseline(BODY_LEADING);
-                        self.draw_text(indent, y, &marker, false, false, false, BODY_SIZE, BLACK);
-                        self.render_line(first_line, content_x, y, BODY_SIZE);
-                    }
-                    for line in lines_iter {
-                        self.ensure_space(BODY_LEADING);
-                        let y = self.next_baseline(BODY_LEADING);
-                        self.render_line(line, content_x, y, BODY_SIZE);
-                    }
-                    self.cursor_top += PARAGRAPH_SPACING_AFTER * 0.4;
-                    for block in rest {
-                        self.render_block(block, content_x);
-                    }
-                }
-                Some((first_block, rest)) => {
-                    self.ensure_space(BODY_LEADING);
-                    let y = self.next_baseline(BODY_LEADING);
-                    self.draw_text(indent, y, &marker, false, false, false, BODY_SIZE, BLACK);
-                    self.render_block(first_block, content_x);
-                    for block in rest {
-                        self.render_block(block, content_x);
-                    }
-                }
-                None => {
-                    self.ensure_space(BODY_LEADING);
-                    let y = self.next_baseline(BODY_LEADING);
-                    self.draw_text(indent, y, &marker, false, false, false, BODY_SIZE, BLACK);
-                }
-            }
+            let marker = Self::list_marker(ordered, start, i);
+            self.render_list_item(item_blocks, indent, content_x, max_width, &marker);
         }
     }
 
