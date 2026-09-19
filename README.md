@@ -57,7 +57,7 @@ From the repo root, run `just` to list recipes. Common entry points:
 | `examples` | Regenerate PDFs for every `cli/examples/*.md`. |
 | `demo` | WASM build, demo deps, Vite dev server. |
 | `demo-build` | WASM build + production static site in `demo/dist/`. |
-| `check` / `clippy` / `fmt` / `fmt-check` | Workspace check, lint, format. |
+| `check` / `test` / `clippy` / `fmt` / `fmt-check` | Workspace check, unit tests, lint, format. |
 | `publish-npm` | Scoped WASM build and npm publish. |
 | `clean` | Rust target artifacts, `wasm/pkg/`, demo `node_modules` / `dist/`. |
 
@@ -149,6 +149,8 @@ Production static output: `just demo-build`.
   breaks (horizontal rules). Anything else CommonMark/GFM can emit (images,
   strikethrough, task lists, …) falls back to plain text rather than failing
   the conversion.
-- No automated tests — verify manually with `just examples` or `just demo`.
+- Unit test coverage is minimal (parser, layout helpers, entry points in
+  `core/`) — run with `just test` (or `cargo test --workspace`). Beyond that,
+  verify manually with `just examples` or `just demo`.
 - Fonts are embedded unsubsetted; OPFS paths are flat filenames (no
   subdirectories).

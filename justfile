@@ -50,6 +50,9 @@ demo-build: build-wasm
 check:
     cargo check --workspace
 
+test:
+    cargo test --workspace
+
 clippy:
     cargo clippy --workspace -- -D warnings
 
