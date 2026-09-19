@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>md2pdf demo</title>
+  </head>
+  <body>
+    <h1>Markdown &rarr; PDF (WASM + OPFS)</h1>
+    <p>
+      Edit the Markdown below, then click Convert. It's written to OPFS, converted to PDF by the
+      WASM module running in a Web Worker, and read back from OPFS for download &mdash; no large
+      buffer crosses the JS/WASM boundary directly.
+    </p>
+    <textarea id="markdown" rows="14" cols="90">
+# Hello from md2pdf
+
+This is a **sample** Markdown document with *italic*, `inline code`, and a
+[link](https://example.com).
+
+- one
+- two
+- three
+
+| Column A | Column B |
+|----------|----------|
+| 1        | 2        |
+    </textarea>
+    <br />
+    <button id="convert">Convert to PDF</button>
+    <p id="status"></p>
+    <a id="download" style="display: none">Download PDF</a>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

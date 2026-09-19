@@ -1,0 +1,11 @@
+/target
+wasm/pkg/
+demo/node_modules/
+demo/dist/
+demo/*.tsbuildinfo
+*.pdf
+!cli/examples/*.pdf
+.DS_Store
+cli/examples/kitchen-sink.pdf
+cli/examples/nested-and-long.pdf
+cli/examples/simple.pdf

@@ -1,0 +1,13 @@
+[package]
+name = "md2pdf-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+pulldown-cmark = { workspace = true }
+printpdf = { workspace = true }
+thiserror = { workspace = true }
