@@ -16,6 +16,7 @@ a Web Worker via OPFS.
 - [md2pdf](#md2pdf)
   - [Layout](#layout)
   - [Prerequisites](#prerequisites)
+  - [Just (task runner)](#just-task-runner)
   - [Build the CLI](#build-the-cli)
   - [Build the WASM module](#build-the-wasm-module)
   - [Bump versions](#bump-versions)
@@ -41,6 +42,24 @@ a Web Worker via OPFS.
   the `wasm32-unknown-unknown` target automatically on first build.
 - [`wasm-pack`](https://rustwasm.github.io/wasm-pack/) — `cargo install wasm-pack`.
 - [`bun`](https://bun.sh) — for the demo page only.
+- [`just`](https://github.com/casey/just) (optional) — `cargo install just` or `brew install just`; wraps the commands below.
+
+## Just (task runner)
+
+[`justfile`](justfile) at the repo root. Run `just` to list recipes.
+
+| Recipe | Purpose |
+| ------ | ------- |
+| `build-cli` / `build-cli-release` | Build the `md2pdf` binary (debug / release). |
+| `build-wasm` | `wasm-pack build wasm --target web` → `wasm/pkg/`. |
+| `build-wasm-npm` | Same with `--scope amwebexpert` for npm publish. |
+| `convert INPUT` | `cargo run -p md2pdf -- convert …` (optional extra flags after the path). |
+| `examples` | Regenerate PDFs for every `cli/examples/*.md`. |
+| `demo` | Build WASM, `bun install`, Vite dev server. |
+| `demo-build` | WASM + production build of `demo/dist/`. |
+| `check` / `clippy` / `fmt` / `fmt-check` | Workspace `cargo check`, clippy, format. |
+| `publish-npm` | Scoped WASM build + `npm publish --access public` in `wasm/pkg/`. |
+| `clean` | `cargo clean` and remove `wasm/pkg/`, demo `node_modules` / `dist/`. |
 
 ## Build the CLI
 
