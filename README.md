@@ -16,6 +16,7 @@ a Web Worker via OPFS.
   - [Prerequisites](#prerequisites)
   - [Build the CLI](#build-the-cli)
   - [Build the WASM module](#build-the-wasm-module)
+  - [Publish the WASM npm package](#publish-the-wasm-npm-package)
   - [Run the demo](#run-the-demo)
   - [Known limitations (v1)](#known-limitations-v1)
 
@@ -66,6 +67,47 @@ friends). These extra exports show up in `md2pdf_wasm.d.ts` alongside our own
 `convert`/`init` — harmless, but not part of this project's API; ignore them.
 They also add to the ~6MB binary size, on top of the embedded Liberation
 fonts (~2.9MB raw, unsubsetted — see `core/src/fonts.rs`).
+
+## Publish the WASM npm package
+
+`wasm-pack` writes an npm package under `wasm/pkg/` (gitignored). The Rust crate
+is `md2pdf-wasm`; we publish to npm as **`@amwebexpert/md2pdf-wasm`** via
+`--scope amwebexpert` (you must control that npm scope). Bump
+`[workspace.package] version` in the repo-root `Cargo.toml` before each release,
+then rebuild.
+
+**Prerequisites:** an [npmjs.com](https://www.npmjs.com/) account and
+[`npm login`](https://docs.npmjs.com/cli/v11/commands/npm-login).
+
+[`wasm-pack build`](https://rustwasm.github.io/docs/wasm-pack/commands/build.html)
+generates `package.json` from the wasm crate's `Cargo.toml` and copies
+`LICENSE` (and `README.md`, if present) into `wasm/pkg/` automatically. This
+crate uses `license.workspace = true` (`MIT`) and `wasm/LICENSE`.
+
+```sh
+wasm-pack build wasm --target web --scope amwebexpert
+```
+
+Dry-run the pack contents:
+
+```sh
+npm pack --dry-run ./wasm/pkg
+```
+
+Publish (scoped packages default to private on npm; `--access public` is required
+for a free public package):
+
+```sh
+cd wasm/pkg
+npm publish --access public
+```
+
+`wasm-pack publish` uploads whatever is already in `wasm/pkg/` — run the scoped
+`build` above first. It does not accept `--scope`.
+
+Consumers install with `npm install @amwebexpert/md2pdf-wasm`, import `init` and `convert`,
+and run the module in a **Web Worker** with **OPFS** (same constraints as the
+demo — see `demo/src/main.ts`).
 
 ## Run the demo
 
