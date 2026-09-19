@@ -5,6 +5,10 @@ a Web Worker via OPFS.
 
 **Repository:** [github.com/amwebexpert/markdown-2-pdf](https://github.com/amwebexpert/markdown-2-pdf)
 
+![WebToolBox PDF export demo](docs/images/demo-webtoolbox-pdf-export.png)
+
+The [WebToolBox](https://amwebexpert.github.io/etoolbox/#/markdown-composer) webapp integrates this PDF export feature in its Markdown Composer route.
+
 [![standard-readme compliant](https://img.shields.io/badge/readme%20style-standard-brightgreen.svg?style=flat-square)](https://github.com/RichardLitt/standard-readme)
 [![Rust](https://img.shields.io/badge/Rust-1.98.1-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![cargo test](https://img.shields.io/badge/tested_with-cargo%20test-blue.svg?style=flat-square&logo=rust&logoColor=white)](https://doc.rust-lang.org/book/ch11-00-testing.html)
