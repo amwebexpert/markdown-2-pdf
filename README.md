@@ -1,9 +1,15 @@
 # md2pdf
 
 Markdown → PDF, in Rust, sharable as a native CLI or a WASM module driven from
-a Web Worker via OPFS. Phase 1 of a larger PDF ⇄ Markdown project for
-[eToolbox](https://github.com/amwebexpert/etoolbox) — Markdown → PDF only;
-PDF → Markdown is out of scope here.
+a Web Worker via OPFS.
+
+[![standard-readme compliant](https://img.shields.io/badge/readme%20style-standard-brightgreen.svg?style=flat-square)](https://github.com/RichardLitt/standard-readme)
+[![Rust](https://img.shields.io/badge/Rust-1.98.1-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org/)
+[![WebAssembly](https://img.shields.io/badge/WebAssembly-654FF0.svg?style=flat-square&logo=webassembly&logoColor=white)](https://webassembly.org/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue.svg?style=flat-square&logo=typescript)](https://www.typescriptlang.org/)
+[![Vite](https://img.shields.io/badge/Vite-6-646CFF.svg?style=flat-square&logo=vite&logoColor=white)](https://vite.dev/)
+[![Bun](https://img.shields.io/badge/Bun-000000.svg?style=flat-square&logo=bun)](https://bun.sh/)
+[![wasm-pack](https://img.shields.io/badge/wasm--pack-Rust%20Wasm-654FF0.svg?style=flat-square&logo=webassembly&logoColor=white)](https://rustwasm.github.io/wasm-pack/)
 
 ## Layout
 
@@ -58,7 +64,7 @@ fonts (~2.9MB raw, unsubsetted — see `core/src/fonts.rs`).
 ```sh
 cd demo
 bun install
-bun run dev
+bun start
 ```
 
 Open the printed local URL. Edit the Markdown, click **Convert to PDF** — it

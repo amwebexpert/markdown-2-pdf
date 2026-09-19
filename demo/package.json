@@ -4,8 +4,10 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "start": "vite dev",
+    "clean:node": "bunx rimraf node_modules bun.lock",
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "bunx rimraf dist && tsc -b && vite build",
     "preview": "vite preview"
   },
   "devDependencies": {
