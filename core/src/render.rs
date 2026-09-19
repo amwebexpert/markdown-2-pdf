@@ -497,13 +497,8 @@ impl Renderer {
         max_width: f32,
         marker: &str,
     ) {
-        let lines = self.wrap_spans_to_lines(
-            spans,
-            max_width,
-            BODY_SIZE,
-            false,
-            &self.fonts.sans_regular,
-        );
+        let lines =
+            self.wrap_spans_to_lines(spans, max_width, BODY_SIZE, false, &self.fonts.sans_regular);
         let mut lines_iter = lines.iter();
         if let Some(first_line) = lines_iter.next() {
             let y = self.reserve_list_line_baseline();
@@ -734,4 +729,92 @@ pub fn render(blocks: &[Block]) -> Result<(Vec<u8>, usize), Md2PdfError> {
         renderer.render_block(block, MARGIN_PT);
     }
     Ok(renderer.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn word(text: &str, width: f32) -> Word {
+        Word {
+            text: text.to_string(),
+            bold: false,
+            italic: false,
+            code: false,
+            link: None,
+            width,
+        }
+    }
+
+    #[test]
+    fn wrap_lines_breaks_once_max_width_is_exceeded() {
+        let tokens = vec![
+            Token::Word(word("aaa", 30.0)),
+            Token::Word(word("bbb", 30.0)),
+            Token::Word(word("ccc", 30.0)),
+        ];
+        let lines = wrap_lines(tokens, 65.0, 5.0);
+        let texts: Vec<Vec<&str>> = lines
+            .iter()
+            .map(|l| l.iter().map(|w| w.text.as_str()).collect())
+            .collect();
+        assert_eq!(texts, vec![vec!["aaa", "bbb"], vec!["ccc"]]);
+    }
+
+    #[test]
+    fn wrap_lines_starts_a_new_line_on_an_explicit_break() {
+        let tokens = vec![
+            Token::Word(word("aaa", 10.0)),
+            Token::Break,
+            Token::Word(word("bbb", 10.0)),
+        ];
+        let lines = wrap_lines(tokens, 1000.0, 5.0);
+        let texts: Vec<Vec<&str>> = lines
+            .iter()
+            .map(|l| l.iter().map(|w| w.text.as_str()).collect())
+            .collect();
+        assert_eq!(texts, vec![vec!["aaa"], vec!["bbb"]]);
+    }
+
+    #[test]
+    fn list_marker_is_bullet_when_unordered() {
+        assert_eq!(Renderer::list_marker(false, 1, 3), "\u{2022}");
+    }
+
+    #[test]
+    fn list_marker_counts_up_from_start_when_ordered() {
+        assert_eq!(Renderer::list_marker(true, 3, 0), "3.");
+        assert_eq!(Renderer::list_marker(true, 3, 2), "5.");
+    }
+
+    #[test]
+    fn wrap_monospace_hard_wraps_without_word_boundaries() {
+        let fonts = FontSet::load().unwrap();
+        let lines = wrap_monospace(&fonts, "abcdefghij", 10.0, 1.0);
+        assert_eq!(lines.len(), "abcdefghij".len());
+        assert_eq!(lines.concat(), "abcdefghij");
+    }
+
+    #[test]
+    fn wrap_monospace_keeps_a_short_line_on_one_row() {
+        let fonts = FontSet::load().unwrap();
+        let lines = wrap_monospace(&fonts, "hi", 10.0, 1000.0);
+        assert_eq!(lines, vec!["hi".to_string()]);
+    }
+
+    #[test]
+    fn render_produces_a_single_page_pdf() {
+        let blocks = vec![
+            Block::Heading {
+                level: 1,
+                spans: vec![Span::plain("Title")],
+            },
+            Block::Paragraph {
+                spans: vec![Span::plain("Body text.")],
+            },
+        ];
+        let (bytes, page_count) = render(&blocks).unwrap();
+        assert_eq!(page_count, 1);
+        assert!(bytes.starts_with(b"%PDF"));
+    }
 }

@@ -20,3 +20,28 @@ pub fn convert(markdown: &str) -> Result<(Vec<u8>, usize), Md2PdfError> {
     let blocks = markdown::parse(markdown);
     render::render(&blocks)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_pdf_output_path_replaces_the_extension() {
+        assert_eq!(
+            default_pdf_output_path("notes.tar.md"),
+            PathBuf::from("notes.tar.pdf")
+        );
+    }
+
+    #[test]
+    fn default_pdf_output_path_appends_when_there_is_none() {
+        assert_eq!(default_pdf_output_path("notes"), PathBuf::from("notes.pdf"));
+    }
+
+    #[test]
+    fn convert_turns_markdown_into_pdf_bytes() {
+        let (bytes, page_count) = convert("# Title\n\nSome *text*.\n").unwrap();
+        assert_eq!(page_count, 1);
+        assert!(bytes.starts_with(b"%PDF"));
+    }
+}

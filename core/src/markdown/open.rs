@@ -89,9 +89,7 @@ fn open_link(stack: &mut Vec<Frame>, url: String) {
 }
 
 fn open_image(stack: &mut Vec<Frame>) {
-    stack.push(Frame::Image {
-        alt: String::new(),
-    });
+    stack.push(Frame::Image { alt: String::new() });
 }
 
 fn open_html_block(stack: &mut Vec<Frame>) {

@@ -12,7 +12,11 @@ pub(super) fn flush_dangling_paragraph(stack: &mut Vec<Frame>) {
     }
 }
 
-pub(super) fn extend_spans(stack: &mut Vec<Frame>, mut spans: Vec<Span>, set_flag: impl Fn(&mut Span)) {
+pub(super) fn extend_spans(
+    stack: &mut Vec<Frame>,
+    mut spans: Vec<Span>,
+    set_flag: impl Fn(&mut Span),
+) {
     for span in &mut spans {
         set_flag(span);
     }
