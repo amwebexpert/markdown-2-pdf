@@ -5,7 +5,7 @@ use pulldown_cmark::Tag;
 use super::align::map_alignment;
 use super::frame::Frame;
 
-pub(super) fn open_tag(stack: &mut Vec<Frame>, tag: Tag) {
+pub(super) fn open_tag(stack: &mut Vec<Frame>, tag: Tag<'_>) {
     match tag {
         Tag::Paragraph => open_paragraph(stack),
         Tag::Heading { .. } => open_heading(stack),

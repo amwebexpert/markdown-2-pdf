@@ -43,6 +43,37 @@ const BLACK: (f32, f32, f32) = (0.0, 0.0, 0.0);
 const RULE_GREY: (f32, f32, f32) = (0.7, 0.7, 0.7);
 const BORDER_GREY: (f32, f32, f32) = (0.6, 0.6, 0.6);
 
+fn rgb((r, g, b): (f32, f32, f32)) -> Color {
+    Color::Rgb(Rgb {
+        r,
+        g,
+        b,
+        icc_profile: None,
+    })
+}
+
+/// Font selection, size and fill color for a single run of text.
+#[derive(Clone, Copy)]
+struct TextStyle {
+    bold: bool,
+    italic: bool,
+    code: bool,
+    size: f32,
+    color: (f32, f32, f32),
+}
+
+impl TextStyle {
+    const fn regular(size: f32) -> Self {
+        Self {
+            bold: false,
+            italic: false,
+            code: false,
+            size,
+            color: BLACK,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Word {
     text: String,
@@ -199,8 +230,8 @@ fn measure_row_natural(fonts: &FontSet, cells: &[Vec<Span>], widths: &mut [f32])
         let code = spans.iter().any(|s| s.code);
         let font = fonts.resolve(bold, italic, code);
         let w = text_width_pt(font, &text, TABLE_FONT_SIZE) + TABLE_CELL_PADDING * 2.0;
-        if w > widths[i] {
-            widths[i] = w;
+        if let Some(width) = widths.get_mut(i) {
+            *width = width.max(w);
         }
     }
 }
@@ -330,31 +361,20 @@ impl Renderer {
         PAGE_HEIGHT_PT - baseline_from_top
     }
 
-    fn draw_text(
-        &mut self,
-        x: f32,
-        y: f32,
-        text: &str,
-        bold: bool,
-        italic: bool,
-        code: bool,
-        size: f32,
-        color: (f32, f32, f32),
-    ) {
+    fn draw_text(&mut self, x: f32, y: f32, text: &str, style: TextStyle) {
         if text.is_empty() {
             return;
         }
+        let TextStyle {
+            bold,
+            italic,
+            code,
+            size,
+            color,
+        } = style;
         let font_id = self.font_id_for(bold, italic, code);
-        let (r, g, b) = color;
         self.ops.push(Op::SaveGraphicsState);
-        self.ops.push(Op::SetFillColor {
-            col: Color::Rgb(Rgb {
-                r,
-                g,
-                b,
-                icc_profile: None,
-            }),
-        });
+        self.ops.push(Op::SetFillColor { col: rgb(color) });
         self.ops.push(Op::StartTextSection);
         self.ops.push(Op::SetFont {
             font: PdfFontHandle::External(font_id),
@@ -397,16 +417,14 @@ impl Renderer {
             } else {
                 BLACK
             };
-            self.draw_text(
-                x,
-                y,
-                &word.text,
-                word.bold,
-                word.italic,
-                word.code,
+            let style = TextStyle {
+                bold: word.bold,
+                italic: word.italic,
+                code: word.code,
                 size,
                 color,
-            );
+            };
+            self.draw_text(x, y, &word.text, style);
             if let Some(url) = word.link.clone() {
                 self.add_link_annotation(x, y, word.width, size, url);
             }
@@ -459,7 +477,7 @@ impl Renderer {
 
     fn render_heading(&mut self, level: u8, spans: &[Span], x0: f32, max_width: f32) {
         let idx = (level as usize).saturating_sub(1).min(5);
-        let size = HEADING_SIZES[idx];
+        let size = HEADING_SIZES.get(idx).copied().unwrap_or(BODY_SIZE);
         let leading = size * HEADING_LEADING_FACTOR;
         self.cursor_top += HEADING_SPACING_BEFORE;
         let lines = self.wrap_spans_to_lines(spans, max_width, size, true, &self.fonts.sans_bold);
@@ -489,7 +507,11 @@ impl Renderer {
             for wrapped in wrap_monospace(&self.fonts, line, CODE_SIZE, max_width) {
                 self.ensure_space(CODE_LEADING);
                 let y = self.next_baseline(CODE_LEADING);
-                self.draw_text(x0, y, &wrapped, false, false, true, CODE_SIZE, BLACK);
+                let style = TextStyle {
+                    code: true,
+                    ..TextStyle::regular(CODE_SIZE)
+                };
+                self.draw_text(x0, y, &wrapped, style);
             }
         }
         if !any {
@@ -513,7 +535,7 @@ impl Renderer {
     }
 
     fn draw_list_marker(&mut self, indent: f32, y: f32, marker: &str) {
-        self.draw_text(indent, y, marker, false, false, false, BODY_SIZE, BLACK);
+        self.draw_text(indent, y, marker, TextStyle::regular(BODY_SIZE));
     }
 
     fn render_list_continuation_lines(
@@ -609,15 +631,9 @@ impl Renderer {
         self.ensure_space(BODY_LEADING);
         self.cursor_top += BODY_LEADING * 0.5;
         let y = PAGE_HEIGHT_PT - self.cursor_top;
-        let (r, g, b) = RULE_GREY;
         self.ops.push(Op::SaveGraphicsState);
         self.ops.push(Op::SetOutlineColor {
-            col: Color::Rgb(Rgb {
-                r,
-                g,
-                b,
-                icc_profile: None,
-            }),
+            col: rgb(RULE_GREY),
         });
         self.ops.push(Op::SetOutlineThickness { pt: Pt(1.0) });
         self.ops.push(Op::DrawLine {
@@ -654,7 +670,7 @@ impl Renderer {
     ) {
         let num_cols = header
             .len()
-            .max(rows.iter().map(|r| r.len()).max().unwrap_or(0))
+            .max(rows.iter().map(Vec::len).max().unwrap_or(0))
             .max(1);
         let available_width = (PAGE_WIDTH_PT - MARGIN_PT - x0).max(1.0);
 
@@ -662,7 +678,7 @@ impl Renderer {
         let total: f32 = col_widths.iter().sum();
         if total > available_width {
             let scale = available_width / total;
-            for w in col_widths.iter_mut() {
+            for w in &mut col_widths {
                 *w *= scale;
             }
         }
@@ -706,15 +722,9 @@ impl Renderer {
 
         let mut x = x0;
         for (i, &w) in col_widths.iter().enumerate() {
-            let (r, g, b) = BORDER_GREY;
             self.ops.push(Op::SaveGraphicsState);
             self.ops.push(Op::SetOutlineColor {
-                col: Color::Rgb(Rgb {
-                    r,
-                    g,
-                    b,
-                    icc_profile: None,
-                }),
+                col: rgb(BORDER_GREY),
             });
             self.ops.push(Op::SetOutlineThickness {
                 pt: Pt(TABLE_BORDER_THICKNESS),

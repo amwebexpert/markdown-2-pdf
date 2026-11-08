@@ -8,7 +8,7 @@ use super::open::open_tag;
 use super::stack::{flush_dangling_paragraph, push_block, push_code, push_text};
 use crate::ir::Block;
 
-fn is_inline_open(tag: &Tag) -> bool {
+fn is_inline_open(tag: &Tag<'_>) -> bool {
     matches!(
         tag,
         Tag::Emphasis | Tag::Strong | Tag::Link { .. } | Tag::Image { .. }
@@ -41,9 +41,8 @@ pub(super) fn apply_event(stack: &mut Vec<Frame>, event: Event<'_>) {
             }
             close_tag(stack, tag_end);
         }
-        Event::Text(text) => push_text(stack, &text),
+        Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => push_text(stack, &text),
         Event::Code(text) => push_code(stack, &text),
-        Event::Html(text) | Event::InlineHtml(text) => push_text(stack, &text),
         Event::SoftBreak => push_text(stack, " "),
         Event::HardBreak => push_text(stack, "\n"),
         Event::Rule => push_block(stack, Block::ThematicBreak),

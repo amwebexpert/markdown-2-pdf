@@ -24,6 +24,12 @@ pub fn init() {
 /// Reads `input_path` (a flat filename at the OPFS root) as Markdown,
 /// converts it to PDF, writes the result back to OPFS, and returns the
 /// output filename (input path with its extension replaced by `.pdf`).
+///
+/// # Errors
+///
+/// Rejects with a JS error if OPFS is unavailable, the input file cannot be
+/// read or is not valid UTF-8, the conversion fails, or the output cannot be
+/// written.
 #[wasm_bindgen]
 pub async fn convert(input_path: &str) -> Result<String, JsValue> {
     let root = opfs_root().await?;
@@ -55,13 +61,18 @@ async fn opfs_root() -> Result<FileSystemDirectoryHandle, JsValue> {
     let storage = global.navigator().storage();
     JsFuture::from(storage.get_directory())
         .await
-        .map(|v| v.unchecked_into())
+        .map(JsCast::unchecked_into)
 }
 
 async fn read_text_file(handle: &FileSystemFileHandle) -> Result<String, JsValue> {
     let access: FileSystemSyncAccessHandle = JsFuture::from(handle.create_sync_access_handle())
         .await?
         .unchecked_into();
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "OPFS file sizes are non-negative integers"
+    )]
     let size = access.get_size()? as usize;
     let mut buf = vec![0u8; size];
     access.read_with_u8_array(&mut buf)?;
