@@ -207,4 +207,170 @@ mod tests {
             other => panic!("expected one paragraph, got {other:?}"),
         }
     }
+
+    #[test]
+    fn empty_input_yields_no_blocks() {
+        assert!(parse("").is_empty());
+    }
+
+    #[test]
+    fn fenced_code_block_keeps_raw_text() {
+        let blocks = parse("```rust\nlet x = *y;\n  indented\n```");
+        assert_eq!(
+            blocks,
+            vec![Block::CodeBlock {
+                text: "let x = *y;\n  indented\n".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn indented_code_block_is_a_code_block() {
+        let blocks = parse("    code here\n");
+        assert_eq!(
+            blocks,
+            vec![Block::CodeBlock {
+                text: "code here\n".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn tight_item_text_is_flushed_before_a_nested_list() {
+        let blocks = parse("- outer\n  - inner\n");
+        match blocks.as_slice() {
+            [Block::List { items, .. }] => match items.as_slice() {
+                [item] => match item.as_slice() {
+                    [Block::Paragraph { spans }, Block::List { items: inner, .. }] => {
+                        assert_eq!(span_text(spans), "outer");
+                        assert_eq!(inner.len(), 1);
+                    }
+                    other => panic!("expected paragraph then list, got {other:?}"),
+                },
+                other => panic!("expected one item, got {other:?}"),
+            },
+            other => panic!("expected one list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loose_list_items_keep_multiple_paragraphs() {
+        let blocks = parse("- first\n\n  second\n\n- third\n");
+        match blocks.as_slice() {
+            [Block::List { items, .. }] => {
+                let shapes: Vec<usize> = items.iter().map(Vec::len).collect();
+                assert_eq!(shapes, vec![2, 1]);
+            }
+            other => panic!("expected one list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tight_item_with_inline_formatting_stays_one_paragraph() {
+        let blocks = parse("- plain **bold** [link](u)\n");
+        match blocks.as_slice() {
+            [Block::List { items, .. }] => match items.as_slice() {
+                [item] => match item.as_slice() {
+                    [Block::Paragraph { spans }] => {
+                        assert_eq!(span_text(spans), "plain bold link");
+                        assert!(spans.iter().any(|s| s.bold && s.text == "bold"));
+                        assert!(spans.iter().any(|s| s.link.as_deref() == Some("u")));
+                    }
+                    other => panic!("expected one paragraph, got {other:?}"),
+                },
+                other => panic!("expected one item, got {other:?}"),
+            },
+            other => panic!("expected one list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn link_inside_strong_is_bold_and_linked() {
+        let blocks = parse("**[x](http://e.com)**");
+        match blocks.as_slice() {
+            [Block::Paragraph { spans }] => match spans.as_slice() {
+                [span] => {
+                    assert!(span.bold);
+                    assert_eq!(span.link.as_deref(), Some("http://e.com"));
+                }
+                other => panic!("expected one span, got {other:?}"),
+            },
+            other => panic!("expected one paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_alt_includes_inline_code_text() {
+        let blocks = parse("![a `b` c](x.png)");
+        match blocks.as_slice() {
+            [Block::Paragraph { spans }] => assert_eq!(span_text(spans), "[image: a b c]"),
+            other => panic!("expected one paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn html_block_is_dropped() {
+        let blocks = parse("<div>\nhidden\n</div>\n\nafter");
+        match blocks.as_slice() {
+            [Block::Paragraph { spans }] => assert_eq!(span_text(spans), "after"),
+            other => panic!("expected one paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_html_is_kept_as_literal_text() {
+        let blocks = parse("a <b>c</b>");
+        match blocks.as_slice() {
+            [Block::Paragraph { spans }] => assert_eq!(span_text(spans), "a <b>c</b>"),
+            other => panic!("expected one paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_extensions_fall_through_as_text() {
+        let blocks = parse("~~gone~~");
+        match blocks.as_slice() {
+            [Block::Paragraph { spans }] => assert_eq!(span_text(spans), "~~gone~~"),
+            other => panic!("expected one paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn table_cells_keep_inline_formatting() {
+        let blocks = parse("| h |\n|---|\n| *i* `c` |\n");
+        match blocks.as_slice() {
+            [
+                Block::Table {
+                    alignments, rows, ..
+                },
+            ] => {
+                assert_eq!(alignments, &[Align::None]);
+                match rows.as_slice() {
+                    [row] => match row.as_slice() {
+                        [cell] => {
+                            assert!(cell.iter().any(|s| s.italic && s.text == "i"));
+                            assert!(cell.iter().any(|s| s.code && s.text == "c"));
+                        }
+                        other => panic!("expected one cell, got {other:?}"),
+                    },
+                    other => panic!("expected one row, got {other:?}"),
+                }
+            }
+            other => panic!("expected one table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blockquote_can_contain_a_list_and_heading() {
+        let blocks = parse("> ## Title\n> - item\n");
+        match blocks.as_slice() {
+            [Block::BlockQuote(inner)] => match inner.as_slice() {
+                [Block::Heading { level: 2, .. }, Block::List { items, .. }] => {
+                    assert_eq!(items.len(), 1);
+                }
+                other => panic!("expected heading then list, got {other:?}"),
+            },
+            other => panic!("expected one blockquote, got {other:?}"),
+        }
+    }
 }

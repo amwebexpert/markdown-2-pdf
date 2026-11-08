@@ -113,3 +113,168 @@ fn links(doc: &Document, page_id: ObjectId) -> Vec<([f32; 4], Rc<str>)> {
         })
         .collect()
 }
+
+#[cfg(test)]
+#[expect(
+    clippy::float_cmp,
+    reason = "test boxes hold exact integer coordinates"
+)]
+mod tests {
+    use super::*;
+    use lopdf::{Stream, dictionary};
+
+    /// One-page document; `page` and `tree` entries are merged into the page
+    /// and page-tree dictionaries.
+    fn doc_with(page: &Dictionary, tree: &Dictionary, content: &str) -> (Document, ObjectId) {
+        let mut doc = Document::with_version("1.7");
+        let contents = doc.add_object(Stream::new(dictionary! {}, content.as_bytes().to_vec()));
+        let tree_id = doc.new_object_id();
+        let mut leaf = dictionary! {
+            "Type" => "Page",
+            "Parent" => tree_id,
+            "Contents" => contents,
+        };
+        leaf.extend(page);
+        let leaf_id = doc.add_object(leaf);
+        let mut root =
+            dictionary! { "Type" => "Pages", "Kids" => vec![leaf_id.into()], "Count" => 1 };
+        root.extend(tree);
+        doc.objects.insert(tree_id, Object::Dictionary(root));
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => tree_id });
+        doc.trailer.set("Root", catalog);
+        (doc, leaf_id)
+    }
+
+    fn rect_obj(r: &[i64]) -> Object {
+        Object::Array(r.iter().copied().map(Object::Integer).collect())
+    }
+
+    fn link_annot(r: [i64; 4], uri: &str) -> Dictionary {
+        dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Link",
+            "Rect" => rect_obj(&r),
+            "A" => dictionary! { "S" => "URI", "URI" => Object::string_literal(uri) },
+        }
+    }
+
+    #[test]
+    fn page_box_defaults_to_us_letter() {
+        let (doc, page) = doc_with(&dictionary! {}, &dictionary! {}, "");
+        assert_eq!(page_box(&doc, page), US_LETTER);
+    }
+
+    #[test]
+    fn page_box_prefers_crop_box_over_media_box() {
+        let (doc, page) = doc_with(
+            &dictionary! {
+                "MediaBox" => rect_obj(&[0, 0, 600, 800]),
+                "CropBox" => rect_obj(&[10, 20, 500, 700]),
+            },
+            &dictionary! {},
+            "",
+        );
+        assert_eq!(page_box(&doc, page), [10.0, 20.0, 500.0, 700.0]);
+    }
+
+    #[test]
+    fn page_box_inherits_media_box_from_the_page_tree() {
+        let (doc, page) = doc_with(
+            &dictionary! {},
+            &dictionary! { "MediaBox" => rect_obj(&[0, 0, 595, 842]) },
+            "",
+        );
+        assert_eq!(page_box(&doc, page), [0.0, 0.0, 595.0, 842.0]);
+    }
+
+    #[test]
+    fn page_box_normalizes_inverted_corners() {
+        let (doc, page) = doc_with(
+            &dictionary! { "MediaBox" => rect_obj(&[612, 792, 0, 0]) },
+            &dictionary! {},
+            "",
+        );
+        assert_eq!(page_box(&doc, page), US_LETTER);
+    }
+
+    #[test]
+    fn page_box_ignores_malformed_rectangles() {
+        let (doc, page) = doc_with(
+            &dictionary! { "MediaBox" => rect_obj(&[0, 0, 100]) },
+            &dictionary! {},
+            "",
+        );
+        assert_eq!(page_box(&doc, page), US_LETTER);
+    }
+
+    #[test]
+    fn links_reads_inline_and_referenced_uri_annotations() {
+        let (mut doc, page) = doc_with(&dictionary! {}, &dictionary! {}, "");
+        let referenced = doc.add_object(link_annot([0, 0, 10, 10], "https://a.test"));
+        let annots = vec![
+            referenced.into(),
+            Object::Dictionary(link_annot([20, 20, 30, 30], " https://b.test ")),
+        ];
+        doc.get_dictionary_mut(page).unwrap().set("Annots", annots);
+
+        let found: Vec<([f32; 4], String)> = links(&doc, page)
+            .into_iter()
+            .map(|(r, uri)| (r, uri.to_string()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ([0.0, 0.0, 10.0, 10.0], "https://a.test".to_string()),
+                ([20.0, 20.0, 30.0, 30.0], "https://b.test".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn links_skips_non_link_annotations_and_blank_uris() {
+        let mut text_annot = link_annot([0, 0, 10, 10], "https://a.test");
+        text_annot.set("Subtype", "Text");
+        let annots = vec![
+            Object::Dictionary(text_annot),
+            Object::Dictionary(link_annot([0, 0, 10, 10], "   ")),
+        ];
+        let (doc, page) = doc_with(&dictionary! { "Annots" => annots }, &dictionary! {}, "");
+        assert!(links(&doc, page).is_empty());
+    }
+
+    #[test]
+    fn extract_attaches_link_targets_to_covered_glyphs() {
+        let font =
+            dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" };
+        let (doc, page) = doc_with(
+            &dictionary! {
+                "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+                "Annots" => vec![Object::Dictionary(link_annot([90, 690, 300, 720], "https://x.test"))],
+            },
+            &dictionary! {},
+            "BT /F1 12 Tf 100 700 Td (in) Tj 300 0 Td (out) Tj ET",
+        );
+        let mut interpreter = Interpreter::new(&doc);
+        let extracted = extract(&doc, &mut interpreter, 1, page).unwrap();
+
+        assert_eq!(extracted.number, 1);
+        assert!(extracted.glyphs.iter().any(|g| g.link.is_some()));
+        assert!(extracted.glyphs.iter().any(|g| g.link.is_none()));
+        for glyph in &extracted.glyphs {
+            let expected = (glyph.x < 300.0).then_some("https://x.test");
+            assert_eq!(glyph.link.as_deref(), expected, "glyph {:?}", glyph.text);
+        }
+    }
+
+    #[test]
+    fn height_is_the_bbox_extent() {
+        let page = Page {
+            number: 1,
+            bbox: [0.0, 10.0, 612.0, 802.0],
+            glyphs: Vec::new(),
+            rulings: Vec::new(),
+            images: Vec::new(),
+        };
+        assert!((page.height() - 792.0).abs() < f32::EPSILON);
+    }
+}

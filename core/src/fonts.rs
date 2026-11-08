@@ -80,3 +80,64 @@ pub fn text_width_pt(font: &ParsedFont, text: &str, size_pt: f32) -> f32 {
         })
         .sum()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_parses_every_embedded_font() {
+        assert!(FontSet::load().is_ok());
+    }
+
+    #[test]
+    fn resolve_picks_mono_for_code_and_sans_otherwise() {
+        let fonts = FontSet::load().unwrap();
+        // Liberation Mono is fixed-pitch; Liberation Sans is not.
+        let narrow = |f: &ParsedFont| text_width_pt(f, "i", 10.0);
+        let wide = |f: &ParsedFont| text_width_pt(f, "W", 10.0);
+        for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mono = fonts.resolve(bold, italic, true);
+            assert!((narrow(mono) - wide(mono)).abs() < 0.01);
+            let sans = fonts.resolve(bold, italic, false);
+            assert!(narrow(sans) < wide(sans));
+        }
+    }
+
+    #[test]
+    fn resolve_returns_distinct_faces_for_each_style() {
+        let fonts = FontSet::load().unwrap();
+        let regular = fonts.resolve(false, false, false);
+        let bold = fonts.resolve(true, false, false);
+        assert!(std::ptr::eq(regular, &raw const fonts.sans_regular));
+        assert!(std::ptr::eq(bold, &raw const fonts.sans_bold));
+        assert!(std::ptr::eq(
+            fonts.resolve(true, true, true),
+            &raw const fonts.mono_bold_italic
+        ));
+        assert!(text_width_pt(bold, "Hello", 12.0) > text_width_pt(regular, "Hello", 12.0));
+    }
+
+    #[test]
+    fn text_width_is_zero_for_empty_text() {
+        let fonts = FontSet::load().unwrap();
+        assert!(text_width_pt(&fonts.sans_regular, "", 12.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn text_width_scales_linearly_with_size_and_length() {
+        let fonts = FontSet::load().unwrap();
+        let font = &fonts.sans_regular;
+        let one = text_width_pt(font, "abc", 10.0);
+        assert!(one > 0.0);
+        assert!((text_width_pt(font, "abc", 20.0) - 2.0 * one).abs() < 0.001);
+        assert!((text_width_pt(font, "abcabc", 10.0) - 2.0 * one).abs() < 0.001);
+    }
+
+    #[test]
+    fn mono_advance_is_six_tenths_of_an_em() {
+        let fonts = FontSet::load().unwrap();
+        let width = text_width_pt(&fonts.mono_regular, "x", 10.0);
+        assert!((width - 6.0).abs() < 0.01, "got {width}");
+    }
+}
