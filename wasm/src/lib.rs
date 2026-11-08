@@ -1,7 +1,9 @@
-//! wasm-bindgen entry point. Must run inside a Web Worker: OPFS's synchronous
-//! access handle (`createSyncAccessHandle`) is only available there, which is
-//! why this module exists separately from `md2pdf-core` — it's the only
-//! place OPFS-specific, worker-only code lives.
+//! wasm-bindgen entry point. [`markdown_to_pdf`] is a plain bytes-in/bytes-out
+//! call usable from any JS context (main thread, worker). [`convert`] must run
+//! inside a Web Worker: OPFS's synchronous access handle
+//! (`createSyncAccessHandle`) is only available there, which is why this
+//! module exists separately from `md2pdf-core` — it's the only place
+//! OPFS-specific, worker-only code lives.
 //!
 //! Acquiring handles (`getDirectory`, `getFileHandle`, `createSyncAccessHandle`)
 //! is Promise-based even in the "sync" OPFS API — only the actual read/write/
@@ -19,6 +21,19 @@ use web_sys::{
 #[wasm_bindgen(start)]
 pub fn init() {
     console_error_panic_hook::set_once();
+}
+
+/// Converts a Markdown string to PDF bytes (a `Uint8Array` in JS). Runs
+/// synchronously, so prefer a Web Worker for large documents.
+///
+/// # Errors
+///
+/// Throws a JS error if the conversion fails.
+#[wasm_bindgen(js_name = markdownToPdf)]
+pub fn markdown_to_pdf(markdown: &str) -> Result<Vec<u8>, JsValue> {
+    md2pdf_core::convert(markdown)
+        .map(|(pdf_bytes, _page_count)| pdf_bytes)
+        .map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
 /// Reads `input_path` (a flat filename at the OPFS root) as Markdown,
