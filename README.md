@@ -48,6 +48,7 @@ The [WebToolBox](https://amwebexpert.github.io/etoolbox/#/markdown-composer) web
 - [`wasm-pack`](https://rustwasm.github.io/wasm-pack/) — `cargo install wasm-pack`.
 - [`bun`](https://bun.sh) — for the demo page only.
 - [`just`](https://github.com/casey/just) — `cargo install just` or `brew install just`; all build and dev tasks go through the [`justfile`](justfile).
+- Lint tooling for `just lint`: `cargo install --locked cargo-deny cargo-machete`.
 
 ## Just (task runner)
 
@@ -63,8 +64,16 @@ From the repo root, run `just` to list recipes. Common entry points:
 | `demo` | WASM build, demo deps, Vite dev server. |
 | `demo-build` | WASM build + production static site in `demo/dist/`. |
 | `check` / `test` / `clippy` / `fmt` / `fmt-check` | Workspace check, unit tests, lint, format. |
+| `lint` | Full quality gate run by CI: format check, Clippy (native + WASM), tests, `cargo deny`, `cargo machete`. |
 | `publish-npm` | Scoped WASM build and npm publish. |
 | `clean` | Rust target artifacts, `wasm/pkg/`, demo `node_modules` / `dist/`. |
+
+### Lint policy
+
+- Rules live in `[workspace.lints]` ([`Cargo.toml`](Cargo.toml)): Clippy `all` (deny) + `pedantic`, plus selected restriction lints (`unwrap_used`, `expect_used`, `panic`, `indexing_slicing`, `print_stdout`, ...). Tests may unwrap/panic ([`clippy.toml`](clippy.toml)).
+- `md2pdf-core` requires docs on its public API (`missing_docs`).
+- Justified exceptions use `#[expect(clippy::lint_name, reason = "...")]` locally, never a bare `#[allow]`.
+- Dependency policy (licenses, advisories, sources): [`deny.toml`](deny.toml).
 
 ## CLI
 

@@ -53,8 +53,28 @@ check:
 test:
     cargo test --workspace
 
+# Lint all crates and tests; warnings are errors (config: `[workspace.lints]` in Cargo.toml).
 clippy:
-    cargo clippy --workspace -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
+
+# Lint the WASM crate for its real target.
+clippy-wasm:
+    cargo clippy -p md2pdf-wasm --target wasm32-unknown-unknown -- -D warnings
+
+# Apply Clippy's automatic fixes.
+clippy-fix:
+    cargo clippy --workspace --all-targets --fix --allow-dirty
+
+# Licenses, security advisories, banned/duplicate crates (`cargo install --locked cargo-deny`).
+deny:
+    cargo deny check
+
+# Unused dependencies (`cargo install --locked cargo-machete`).
+machete:
+    cargo machete
+
+# Full quality gate (same checks as CI).
+lint: fmt-check clippy clippy-wasm test deny machete
 
 fmt:
     cargo fmt --all
