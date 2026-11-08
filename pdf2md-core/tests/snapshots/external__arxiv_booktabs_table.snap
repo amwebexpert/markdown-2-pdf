@@ -1,0 +1,33 @@
+---
+source: pdf2md-core/tests/external.rs
+expression: md
+---
+**Table I:** What each activity costs an administrator and a researcher. Total effort is the sum, over all outputs, of the cost of the activity each output needs, plus the session overheads.
+
+| Activity | Number | Administrator | Researcher |
+| :-- | :-- | :-- | :-- |
+| Verify a delivered, confirmed output | *nv* | *tv* | *td* |
+| Check, and if need be reject, a delivered, unconfirmed output *u* | *nu* | *tc* + (1 *− ru*)(*tx − tc*) | *td* |
+| Enter a confirmed output the feed misses | *ne* | *te* | *te* |
+| Respond to a notification | *k* | — | *s* |
+
+**Table II:** Unit times of the effort model. Central values are used unless stated; the range gives the low and high settings. Two parameters, the time to investigate an attribution (*tx*) and the overhead of a researcher’s session (*s*), are not measured in any published source: both are varied across their ranges.
+
+| Activity Central | Range Basis |
+| :-- | :-- |
+| Verify a confirmed output, *tv* | 15 s 10–20 s screening medians \[35\] |
+| Check an unconfirmed output, *tc* | 35 s 35–74 s screening mean \[26\]; copy cataloguing \[55\] |
+| Investigate an attribution, *tx* | 5 min 1–15 min not measured; upper value from full-text assessment \[65\] |
+| Enter a missing output, *te* | 3 min 3–10 min manual entry \[16, 58\]; deposit \[66\] |
+| Researcher decision, *td* | 15 s as *tv* |
+| Session overhead, *s* | 2 min 0–10 min not measured; varied; authentication \[51\] |
+
+before the observation date. A feed delivers an output when the output is added to the source, not when it was published, so the recurring effort is measured by the date each output was added. Dimensions records that date for every publication \[13\], and its index is updated daily \[25\]. OpenAlex’s record creation dates cannot be used, because they were reset in bulk in October 2025. Each output is therefore dated by the day the same DOI entered Dimensions, for both sources. Dimensions holds 99.7% of the DOIs that OpenAlex attributes; the rest are dated by their Crossref registration.
+
+Two quantities in the recurring effort cannot be read directly from the data. The first is whether a new output will be confirmed. For this investigation, the Discovery instances were last observed on 26 May 2026, so outputs added during the year had little or no time to be confirmed before it, and none after. Each new output is instead given a probability of confirmation equal to the precision ratio of its identifier before the year began. The second is the number of outputs that will need to be entered by hand. That depends on how much the researchers publish, which is the same whichever source the institution uses, so a single publication rate is used for both. It is estimated in two steps: the expected number of genuine new outputs found by either source in the year, divided by the share of the institutional record that the two sources together recover. The result is some 296,857 outputs a year across the primary sample. Two summaries are reported. For the backlog at adoption, which a research office takes on when it connects a source, the threshold at which administrator effort is lowest is used. For the recurring effort, the researcher workflow: only researchers can tell that an identifier has stopped carrying their work because another has been created, and only they control the ORCID route by which new outputs are claimed automatically. It is reported as the difference between the sources in person-days and as their ratio, with the session overhead and the entry time varied together. The two act differently. Every session is shared by both sources, so a longer overhead adds the same time to each and narrows their ratio, whereas entry falls mostly on the source that misses more output, so a longer entry time widens the gap. A low overhead with slow entry therefore gives a different comparison from a high overhead with fast entry, even where the totals for one source are similar.
+
+**IV. RESULTS**
+
+**A. Replicating the institutional record**
+
+Pooled across the 30 primary-scope institutions, the two sources reconstruct the institutions’ own records to markedly different extents (Table III). Of the publications that OpenAlex attributes to matched researchers, 50.4% are confirmed by an existing publication–researcher link in the institution’s Discovery instance; for Dimensions the confirmed share is 69.6%. Read from the side of risk, 46.6% of OpenAlex’s attributed research outputs are assertions whose publication is entirely absent from the institution’s own record, against 26.7% for Dimensions, an exposure 1.7 times as large as a share of each source’s own claims. Both sources also surface low-risk addi-

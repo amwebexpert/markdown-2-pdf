@@ -30,12 +30,18 @@ fn main() {
 
 ## Table
 
-**Name Role Notes** Ada Engineer Loves *long* variable names Grace Admiral `COBOL` pioneer Alan Mathematician See [bio](https://example.com/alan)
+| Name | Role | Notes |
+| :-- | :-: | --: |
+| Ada | Engineer | Loves *long* variable names |
+| Grace | Admiral | `COBOL` pioneer |
+| Alan | Mathematician | See [bio](https://example.com/alan) |
 
 ## Unsupported constructs (best-effort fallback)
 
 This is a blockquote, indented under the heading.
 
 Here's an image reference: \[image: a diagram\]
+
+---
 
 That was a thematic break above this paragraph.

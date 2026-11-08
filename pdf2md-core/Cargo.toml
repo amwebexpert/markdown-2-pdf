@@ -9,6 +9,7 @@ crate-type = ["lib"]
 
 [dependencies]
 lopdf = { workspace = true }
+png = "0.18.1"
 thiserror = { workspace = true }
 
 [dev-dependencies]
