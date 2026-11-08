@@ -3,6 +3,7 @@ name = "md2pdf"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false  # shipped as a binary / npm package, not on crates.io
 
 [[bin]]
 name = "md2pdf"
@@ -12,3 +13,6 @@ path = "src/main.rs"
 md2pdf-core = { path = "../core" }
 clap = { version = "4", features = ["derive"] }
 anyhow = { workspace = true }
+
+[lints]
+workspace = true
