@@ -176,14 +176,33 @@ duplicate a `version = "…"` line there unless you intentionally opt out of the
 1. Edit `[workspace.package] version` in the repo-root [`Cargo.toml`](Cargo.toml)
    (e.g. `0.1.1` → `0.1.2`). Use [semver](https://semver.org/) — breaking API or output changes → major; backward-compatible features → minor; fixes → patch.
 2. Rebuild what you ship: `just build-cli` and `just build-wasm` (regenerates `wasm/pkg/package.json` with the new version).
-3. Commit [`Cargo.toml`](Cargo.toml) and [`Cargo.lock`](Cargo.lock) together with the release tag or PR.
+3. Commit [`Cargo.toml`](Cargo.toml) and [`Cargo.lock`](Cargo.lock) in a PR; after merge, push a `vX.Y.Z` tag to [publish](#publish-the-wasm-npm-package).
 
 The [`demo/`](demo/) app is private (`demo/package.json` has its own `version`); bump it only if you care about local bookkeeping — it is not published.
 
 ## Publish the WASM npm package
 
 `wasm-pack` writes an npm package under `wasm/pkg/` (gitignored). The Rust crate
-is `md2pdf-wasm`; we publish to npm as **`@amwebexpert/md2pdf-wasm`** (you must control the `amwebexpert` npm scope). [Bump versions](#bump-versions) first, then:
+is `md2pdf-wasm`; we publish to npm as **`@amwebexpert/md2pdf-wasm`** (you must control the `amwebexpert` npm scope).
+
+**Automated (preferred):** [bump versions](#bump-versions) in a PR, merge it, then
+tag the merge commit on `master`:
+
+```sh
+git checkout master && git pull
+git tag v0.2.0   # must equal [workspace.package] version
+git push origin v0.2.0
+```
+
+The [Release workflow](.github/workflows/release.yml) checks the tag against the
+workspace version, runs the tests, builds the scoped package, publishes it to npm
+with provenance, and creates a GitHub Release with generated notes. It
+authenticates through npm [trusted publishing](https://docs.npmjs.com/trusted-publishers)
+(OIDC, no token secret): one-time setup on npmjs.com → package **Settings** →
+**Trusted Publisher** → GitHub Actions, repository `amwebexpert/markdown-2-pdf`,
+workflow `release.yml`.
+
+**Manual fallback:**
 
 ```sh
 just publish-npm

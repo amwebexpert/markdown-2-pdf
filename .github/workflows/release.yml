@@ -1,0 +1,51 @@
+name: Release
+
+# Push a `vX.Y.Z` tag matching `[workspace.package] version` in Cargo.toml to
+# publish `@amwebexpert/md2pdf-wasm` to npm and create a GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  npm:
+    name: Publish WASM package to npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release
+      id-token: write # npm trusted publishing (OIDC) and provenance
+    steps:
+      - uses: actions/checkout@v4
+      # Installs the toolchain, components and targets from rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check tag matches workspace version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "md2pdf-wasm") | .version')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match workspace version $version"
+            exit 1
+          fi
+
+      - run: cargo test --workspace
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - run: wasm-pack build wasm --target web --scope amwebexpert
+
+      # Trusted publishing needs npm >= 11.5.1 (bundled with Node 24).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm publish --access public
+        working-directory: wasm/pkg
+
+      - run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
+        env:
+          GH_TOKEN: ${{ github.token }}
