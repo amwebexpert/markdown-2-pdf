@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -24,14 +24,15 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Convert { input, output } => convert(input, output),
+        Command::Convert { input, output } => convert(&input, output),
     }
 }
 
-fn convert(input: PathBuf, output: Option<PathBuf>) -> Result<()> {
-    let output = output.unwrap_or_else(|| md2pdf_core::default_pdf_output_path(&input));
+#[expect(clippy::print_stdout, reason = "reporting the result is the CLI's job")]
+fn convert(input: &Path, output: Option<PathBuf>) -> Result<()> {
+    let output = output.unwrap_or_else(|| md2pdf_core::default_pdf_output_path(input));
 
-    let markdown = std::fs::read_to_string(&input)
+    let markdown = std::fs::read_to_string(input)
         .with_context(|| format!("failed to read {}", input.display()))?;
 
     let (pdf_bytes, page_count) = md2pdf_core::convert(&markdown)

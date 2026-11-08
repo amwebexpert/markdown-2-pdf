@@ -1,0 +1,29 @@
+# cargo-deny configuration — https://embarkstudios.github.io/cargo-deny/
+# Run with `just deny` (or `cargo deny check`).
+
+[graph]
+all-features = true
+
+[advisories]
+# Fail on RustSec vulnerabilities, unmaintained and yanked crates.
+yanked = "deny"
+
+[licenses]
+# Permissive licenses compatible with this MIT project.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

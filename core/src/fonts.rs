@@ -71,11 +71,11 @@ impl FontSet {
 /// same measurement printpdf itself would use, computed up front so the
 /// layout engine can wrap and size content before any drawing op is emitted.
 pub fn text_width_pt(font: &ParsedFont, text: &str, size_pt: f32) -> f32 {
-    let upm = (font.units_per_em.max(1)) as f32;
+    let upm = f32::from(font.units_per_em.max(1));
     text.chars()
         .map(|c| {
             let gid = font.lookup_glyph_index(c as u32).unwrap_or(0);
-            let w = font.get_glyph_width(gid).unwrap_or(0) as f32;
+            let w = f32::from(font.get_glyph_width(gid).unwrap_or(0));
             (w / upm) * size_pt
         })
         .sum()

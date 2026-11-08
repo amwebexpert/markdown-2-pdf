@@ -1,3 +1,8 @@
+//! Markdown to PDF conversion: parses CommonMark (plus tables) and lays it out
+//! as a paginated US Letter PDF with embedded fonts.
+
+#![warn(missing_docs)]
+
 mod error;
 mod fonts;
 mod ir;
@@ -16,6 +21,10 @@ pub fn default_pdf_output_path(input: impl AsRef<Path>) -> PathBuf {
 }
 
 /// Converts a Markdown document into PDF bytes, along with the page count.
+///
+/// # Errors
+///
+/// Returns [`Md2PdfError::FontParse`] if an embedded font cannot be parsed.
 pub fn convert(markdown: &str) -> Result<(Vec<u8>, usize), Md2PdfError> {
     let blocks = markdown::parse(markdown);
     render::render(&blocks)

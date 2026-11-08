@@ -11,3 +11,6 @@ crate-type = ["lib"]
 pulldown-cmark = { workspace = true }
 printpdf = { workspace = true }
 thiserror = { workspace = true }
+
+[lints]
+workspace = true

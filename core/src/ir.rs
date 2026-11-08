@@ -27,6 +27,10 @@ pub enum Align {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "variant names mirror CommonMark element names"
+)]
 pub enum Block {
     Heading {
         level: u8,

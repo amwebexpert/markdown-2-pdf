@@ -34,14 +34,16 @@ pub(super) fn push_span(stack: &mut Vec<Frame>, span: Span) {
     if matches!(stack.last(), Some(Frame::Container(_))) {
         stack.push(Frame::Paragraph(Vec::new()));
     }
-    match stack.last_mut() {
-        Some(Frame::Paragraph(spans))
-        | Some(Frame::Heading(spans))
-        | Some(Frame::Emphasis(spans))
-        | Some(Frame::Strong(spans))
-        | Some(Frame::Link { spans, .. })
-        | Some(Frame::TableCell(spans)) => spans.push(span),
-        _ => {}
+    if let Some(
+        Frame::Paragraph(spans)
+        | Frame::Heading(spans)
+        | Frame::Emphasis(spans)
+        | Frame::Strong(spans)
+        | Frame::Link { spans, .. }
+        | Frame::TableCell(spans),
+    ) = stack.last_mut()
+    {
+        spans.push(span);
     }
 }
 
