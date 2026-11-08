@@ -4,13 +4,19 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false  # shipped as a binary / npm package, not on crates.io
+default-run = "md2pdf"
 
 [[bin]]
 name = "md2pdf"
 path = "src/main.rs"
 
+[[bin]]
+name = "pdf2md"
+path = "src/bin/pdf2md.rs"
+
 [dependencies]
 md2pdf-core = { path = "../core" }
+pdf2md-core = { path = "../pdf2md-core" }
 clap = { version = "4", features = ["derive"] }
 anyhow = { workspace = true }
 

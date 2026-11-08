@@ -1,7 +1,8 @@
 # md2pdf
 
 Markdown → PDF, in Rust, sharable as a native CLI or a WASM module driven from
-a Web Worker via OPFS.
+a Web Worker via OPFS. The reverse direction, PDF → Markdown, ships as the
+[`pdf2md`](#pdf--markdown-pdf2md) CLI.
 
 **Repository:** [github.com/amwebexpert/markdown-2-pdf](https://github.com/amwebexpert/markdown-2-pdf)
 
@@ -23,6 +24,7 @@ The [WebToolBox](https://amwebexpert.github.io/etoolbox/#/markdown-composer) web
   - [Prerequisites](#prerequisites)
   - [Just (task runner)](#just-task-runner)
   - [CLI](#cli)
+  - [PDF → Markdown (pdf2md)](#pdf--markdown-pdf2md)
   - [WASM module](#wasm-module)
   - [Bump versions](#bump-versions)
   - [Publish the WASM npm package](#publish-the-wasm-npm-package)
@@ -35,7 +37,11 @@ The [WebToolBox](https://amwebexpert.github.io/etoolbox/#/markdown-composer) web
   hand-rolled text layout and PDF generation via `printpdf`). No I/O, no
   wasm-bindgen. Compiles to both native and `wasm32-unknown-unknown`
   unmodified.
-- [`cli/`](cli/) — `md2pdf` binary (`clap`), reads a `.md` file, writes a `.pdf` file.
+- [`pdf2md-core/`](pdf2md-core/) — the reverse direction: PDF parsing via
+  `lopdf`, a minimal content-stream interpreter and layout heuristics that
+  rebuild GitHub-flavored Markdown. No I/O.
+- [`cli/`](cli/) — `md2pdf` binary (`clap`), reads a `.md` file, writes a `.pdf` file;
+  plus the `pdf2md` binary for the reverse direction.
 - [`wasm/`](wasm/) — `wasm-bindgen` wrapper exposing `convert(path)` to JS. This is
   the only crate that touches OPFS; it must run inside a Web Worker (OPFS's
   synchronous access handle is worker-only).
@@ -56,11 +62,13 @@ From the repo root, run `just` to list recipes. Common entry points:
 
 | Recipe | Purpose |
 | ------ | ------- |
-| `build-cli` / `build-cli-release` | Native `md2pdf` binary (debug / release). |
+| `build-cli` / `build-cli-release` | Native `md2pdf` and `pdf2md` binaries (debug / release). |
 | `build-wasm` | Browser WASM package in `wasm/pkg/`. |
 | `build-wasm-npm` | Scoped WASM build for npm (`@amwebexpert/md2pdf-wasm`). |
 | `convert INPUT` | Convert one Markdown file (optional flags after the path, e.g. `-o out.pdf`). |
 | `examples` | Regenerate PDFs for every `cli/examples/*.md`. |
+| `pdf2md INPUT` | Convert one PDF to Markdown (optional flags after the path, e.g. `-o out.md --pages 2-5`). |
+| `snapshots` | Rewrite the `pdf2md-core` snapshot files to the current output (review the diff before committing). |
 | `demo` | WASM build, demo deps, Vite dev server. |
 | `demo-build` | WASM build + production static site in `demo/dist/`. |
 | `check` / `test` / `clippy` / `fmt` / `fmt-check` | Workspace check, unit tests, lint, format. |
@@ -71,7 +79,7 @@ From the repo root, run `just` to list recipes. Common entry points:
 ### Lint policy
 
 - Rules live in `[workspace.lints]` ([`Cargo.toml`](Cargo.toml)): Clippy `all` (deny) + `pedantic`, plus selected restriction lints (`unwrap_used`, `expect_used`, `panic`, `indexing_slicing`, `print_stdout`, ...). Tests may unwrap/panic ([`clippy.toml`](clippy.toml)).
-- `md2pdf-core` requires docs on its public API (`missing_docs`).
+- `md2pdf-core` and `pdf2md-core` require docs on their public API (`missing_docs`).
 - Justified exceptions use `#[expect(clippy::lint_name, reason = "...")]` locally, never a bare `#[allow]`.
 - Dependency policy (licenses, advisories, sources): [`deny.toml`](deny.toml).
 
@@ -84,6 +92,40 @@ From the repo root, run `just` to list recipes. Common entry points:
 See [`cli/examples/`](cli/examples/) for inputs (`simple.md`, `kitchen-sink.md` — every
 supported construct, `nested-and-long.md` — nested lists and multi-page
 pagination). Example PDFs are not committed; see [`.gitignore`](.gitignore).
+
+## PDF → Markdown (pdf2md)
+
+- Convert: `just pdf2md paper.pdf` — output defaults to the input path with a `.md`
+  extension. Flags: `-o out.md`, `--pages 3` or `--pages 2-5` (1-based, inclusive),
+  `--keep-headers` (keep running headers, footers and page numbers).
+- Pages whose content cannot be parsed are replaced by an
+  `<!-- page N: extraction failed -->` comment and reported on stderr; the rest of
+  the document is still converted.
+
+How it works: [`pdf2md-core`](pdf2md-core/) runs each page's content stream to
+place every glyph (font size, bold/italic/monospace flags, link annotations),
+groups glyphs into lines, drops repeated page furniture, reads two-column pages
+column by column, then rebuilds Markdown blocks:
+
+| Markdown | Recovered from |
+| -------- | -------------- |
+| Headings `#`–`######` | Font sizes above the body size (the most common size), largest first. Bold-only lines are not promoted. |
+| Paragraphs | Vertical gaps and short closing lines; wrapped lines and end-of-line hyphenation are rejoined. |
+| `-` / `1.` lists, nested | Bullet glyphs, vector-drawn bullets (browsers) and `N.` / `N)` markers; nesting from the marker indent. |
+| `**bold**`, `*italic*`, `` `code` `` | Font names, font descriptor flags, and equal glyph widths for monospace faces. |
+| `[text](url)` | URI link annotations over the text. |
+| Fenced code blocks | Runs of monospace lines; indentation recovered from glyph positions. |
+
+Tests: [`pdf2md-core/tests/`](pdf2md-core/tests/) round-trips Markdown through
+md2pdf and back (exact match for supported constructs) and snapshots output for
+PDFs from other producers (Chrome, REVTeX/arXiv) — provenance and licences in
+[`pdf2md-core/tests/fixtures/README.md`](pdf2md-core/tests/fixtures/README.md).
+
+Limitations (phase 1): tables come out as plain paragraphs and images are skipped
+(both planned next); scanned PDFs (no text layer) and password-protected files
+are not supported; rotated text, vector figures and math are not reconstructed;
+a hyphen at a line end followed by a lowercase word is always treated as
+hyphenation (`document-level` → `documentlevel`).
 
 ## WASM module
 
@@ -106,7 +148,8 @@ All Rust crates share one semver via the workspace:
 | Crate (directory) | Package name  | Version source                                                        |
 | ----------------- | ------------- | --------------------------------------------------------------------- |
 | [`core/`](core/)  | `md2pdf-core` | [`Cargo.toml`](Cargo.toml) → `[workspace.package] version`            |
-| [`cli/`](cli/)    | `md2pdf`      | same                                                                  |
+| [`cli/`](cli/)    | `md2pdf`      | same (ships the `md2pdf` and `pdf2md` binaries)                       |
+| [`pdf2md-core/`](pdf2md-core/) | `pdf2md-core` | same                                                     |
 | [`wasm/`](wasm/)  | `md2pdf-wasm` | same (becomes npm `@amwebexpert/md2pdf-wasm` after `just build-wasm`) |
 
 Each member crate sets `version.workspace = true` in its own `Cargo.toml`; do **not**
