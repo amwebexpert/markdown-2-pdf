@@ -1,10 +1,11 @@
-//! Per-page extraction: page box, positioned glyphs, and URI link targets.
+//! Per-page extraction: page box, positioned glyphs, rulings, images, and URI
+//! link targets.
 
 use std::rc::Rc;
 
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
-use crate::interp::{Glyph, Interpreter};
+use crate::interp::{Glyph, ImagePlacement, Interpreter, Ruling};
 
 const US_LETTER: [f32; 4] = [0.0, 0.0, 612.0, 792.0];
 
@@ -15,6 +16,10 @@ pub struct Page {
     /// Visible area `[x0, y0, x1, y1]` in default user space.
     pub bbox: [f32; 4],
     pub glyphs: Vec<Glyph>,
+    /// Axis-aligned painted lines (table borders, rules).
+    pub rulings: Vec<Ruling>,
+    /// Raster images in drawing order.
+    pub images: Vec<ImagePlacement>,
 }
 
 impl Page {
@@ -29,7 +34,8 @@ pub fn extract(
     number: u32,
     page_id: ObjectId,
 ) -> lopdf::Result<Page> {
-    let mut glyphs = interpreter.run_page(page_id)?;
+    let content = interpreter.run_page(page_id)?;
+    let mut glyphs = content.glyphs;
     let links = links(doc, page_id);
     if !links.is_empty() {
         for glyph in &mut glyphs {
@@ -45,6 +51,8 @@ pub fn extract(
         number,
         bbox: page_box(doc, page_id),
         glyphs,
+        rulings: content.rulings,
+        images: content.images,
     })
 }
 

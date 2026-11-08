@@ -1,0 +1,36 @@
+---
+source: pdf2md-core/tests/external.rs
+expression: output.markdown
+---
+![](media_assets/img-001.png)
+
+# Media sampler
+
+This page mixes a bordered table, a borderless table and a few raster images.
+
+## Bordered table
+
+| Station | Instrument | Notes |
+| :-- | :-- | :-- |
+| North | Rain gauge | Checked weekly<br>by the field team |
+| South | Anemometer | Replaced in May |
+
+## Borderless table
+
+| Week | Rainfall | Wind |
+| :-- | :-- | :-- |
+| One | 12 mm | Calm |
+| Two | 30 mm | Gusty |
+| Three | 4 mm | Breezy |
+
+## Images
+
+A transparent PNG and a JPEG photo follow.
+
+![](media_assets/img-002.png)
+
+![](media_assets/img-003.jpg)
+
+The logo appears again below.
+
+![](media_assets/img-001.png)

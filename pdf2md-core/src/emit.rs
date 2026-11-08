@@ -5,6 +5,7 @@ use std::rc::Rc;
 
 use crate::blocks::{Block, Run};
 use crate::font::FontStyle;
+use crate::tables::Align;
 
 /// Marker x positions closer than this (pt) share one list nesting level.
 const LEVEL_TOLERANCE: f32 = 4.0;
@@ -33,6 +34,11 @@ pub fn markdown(blocks: &[Block]) -> String {
             Block::Comment(text) => {
                 let _ = write!(out, "<!-- {} -->", text.replace("--", "- -"));
             }
+            Block::Image { src, alt } => {
+                let _ = write!(out, "![{}]({})", escape(alt), link_target(src));
+            }
+            Block::Table { align, rows } => out.push_str(&table(align, rows)),
+            Block::Rule => out.push_str("---"),
             Block::ListItem { .. } => {
                 let end = blocks
                     .get(i..)
@@ -90,6 +96,51 @@ fn list(items: &[Block]) -> String {
             " ".repeat(indent),
             inline(runs, false).trim()
         ));
+    }
+    lines.join("\n")
+}
+
+/// GFM table; the header row loses its bold when every header cell is bold
+/// (the usual header styling, not emphasis).
+fn table(align: &[Align], rows: &[Vec<Vec<Run>>]) -> String {
+    let all_bold = |cells: &[Vec<Run>]| {
+        cells
+            .iter()
+            .flatten()
+            .filter(|r| !r.text.trim().is_empty())
+            .all(|r| r.style.bold)
+    };
+    let row_line = |cells: &[Vec<Run>], strip_bold: bool| {
+        let texts: Vec<String> = (0..align.len())
+            .map(|c| {
+                let text = cells
+                    .get(c)
+                    .map(|runs| inline(runs, strip_bold).trim().to_string())
+                    .unwrap_or_default();
+                let text = text.replace('|', "\\|").replace('\n', "<br>");
+                if text.is_empty() {
+                    " ".to_string()
+                } else {
+                    text
+                }
+            })
+            .collect();
+        format!("| {} |", texts.join(" | "))
+    };
+    let mut lines = Vec::new();
+    if let Some((header, body)) = rows.split_first() {
+        lines.push(row_line(header, all_bold(header)));
+        let delimiters: Vec<&str> = align
+            .iter()
+            .map(|a| match a {
+                Align::None => "---",
+                Align::Left => ":--",
+                Align::Center => ":-:",
+                Align::Right => "--:",
+            })
+            .collect();
+        lines.push(format!("| {} |", delimiters.join(" | ")));
+        lines.extend(body.iter().map(|row| row_line(row, false)));
     }
     lines.join("\n")
 }
@@ -338,6 +389,37 @@ mod tests {
             item(Some(2), 72.0, "two"),
         ];
         assert_eq!(markdown(&blocks), "1. one\n   - child\n2. two\n");
+    }
+
+    #[test]
+    fn tables_images_and_rules() {
+        let cell = |text: &str, bold: bool| vec![run(text, bold, false, false)];
+        let blocks = [
+            Block::Table {
+                align: vec![Align::Left, Align::Right],
+                rows: vec![
+                    vec![cell("Name", true), cell("Notes", true)],
+                    vec![cell("a|b", false), vec![]],
+                    vec![
+                        cell("x", false),
+                        vec![
+                            run("one", false, false, false),
+                            run("\n", false, false, false),
+                            run("two", false, false, false),
+                        ],
+                    ],
+                ],
+            },
+            Block::Rule,
+            Block::Image {
+                src: "doc_assets/img-001.png".to_string(),
+                alt: String::new(),
+            },
+        ];
+        assert_eq!(
+            markdown(&blocks),
+            "| Name | Notes |\n| :-- | --: |\n| a\\|b |   |\n| x | one<br>two |\n\n---\n\n![](doc_assets/img-001.png)\n"
+        );
     }
 
     #[test]

@@ -1,15 +1,17 @@
-//! Structure pass: reading-ordered lines → Markdown blocks.
+//! Structure pass: reading-ordered items → Markdown blocks.
 //!
 //! Headings come from font sizes above the body size (the most common size),
 //! list items from bullet/number markers, code blocks from runs of monospace
-//! lines, and paragraphs from vertical gaps and short closing lines.
+//! lines, and paragraphs from vertical gaps and short closing lines. Tables,
+//! images and rules close the open block and stand on their own.
 
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::font::FontStyle;
 use crate::interp::Glyph;
-use crate::layout::{Line, dominant_size, half_points};
+use crate::layout::{Item, Line, dominant_size, half_points};
+use crate::tables::{Align, Cell, Table};
 
 /// Smallest size ratio over the body size that counts as a heading.
 const HEADING_RATIO: f32 = 1.1;
@@ -49,12 +51,22 @@ pub enum Block {
         runs: Vec<Run>,
     },
     Comment(String),
+    Image {
+        src: String,
+        alt: String,
+    },
+    Table {
+        align: Vec<Align>,
+        /// `rows[0]` is the header; a `"\n"` run is a line break in a cell.
+        rows: Vec<Vec<Vec<Run>>>,
+    },
+    Rule,
 }
 
-/// Lines from one page, or a marker for a page whose content failed to parse.
+/// Items from one page, or a marker for a page whose content failed to parse.
 #[derive(Debug)]
-pub enum PageLines {
-    Lines(Vec<Line>),
+pub enum PageItems {
+    Items(Vec<Item>),
     Failed(u32),
 }
 
@@ -81,14 +93,19 @@ struct Metrics {
     heading_levels: HashMap<i32, usize>,
 }
 
-pub fn build(pages: Vec<PageLines>) -> Vec<Block> {
+/// Builds blocks; `image` turns an image item (page, index) into its block.
+pub fn build(pages: Vec<PageItems>, image: &mut dyn FnMut(u32, usize) -> Block) -> Vec<Block> {
     let all: Vec<&Line> = pages
         .iter()
         .filter_map(|p| match p {
-            PageLines::Lines(lines) => Some(lines),
-            PageLines::Failed(_) => None,
+            PageItems::Items(items) => Some(items),
+            PageItems::Failed(_) => None,
         })
         .flatten()
+        .filter_map(|item| match item {
+            Item::Line(line) => Some(line),
+            _ => None,
+        })
         .collect();
     let metrics = metrics(&all);
 
@@ -96,13 +113,23 @@ pub fn build(pages: Vec<PageLines>) -> Vec<Block> {
     let mut open: Option<Open> = None;
     for page in pages {
         match page {
-            PageLines::Failed(number) => {
+            PageItems::Failed(number) => {
                 close(open.take(), &mut blocks);
                 blocks.push(Block::Comment(format!("page {number}: extraction failed")));
             }
-            PageLines::Lines(lines) => {
-                for line in lines {
-                    open = Some(push_line(open.take(), line, &metrics, &mut blocks));
+            PageItems::Items(items) => {
+                for item in items {
+                    let block = match item {
+                        Item::Line(line) => {
+                            open = Some(push_line(open.take(), line, &metrics, &mut blocks));
+                            continue;
+                        }
+                        Item::Image { page, index } => image(page, index),
+                        Item::Table { table, .. } => table_block(table),
+                        Item::Rule { .. } => Block::Rule,
+                    };
+                    close(open.take(), &mut blocks);
+                    blocks.push(block);
                 }
             }
         }
@@ -406,6 +433,46 @@ fn join_lines(lines: &[Line], skip_first: usize) -> Vec<Run> {
     runs
 }
 
+fn table_block(table: Table) -> Block {
+    Block::Table {
+        align: table.align,
+        rows: table
+            .rows
+            .into_iter()
+            .map(|row| row.into_iter().map(|cell| cell_runs(&cell)).collect())
+            .collect(),
+    }
+}
+
+/// A cell's runs, its lines separated by `"\n"` runs (`<br>` in GFM) except
+/// where a hyphenated word continues on the next line.
+fn cell_runs(cell: &Cell) -> Vec<Run> {
+    let mut runs: Vec<Run> = Vec::new();
+    for line in cell {
+        let next = line_runs(line);
+        if let (Some(last), Some(first)) = (runs.last_mut(), next.first()) {
+            let hyphenated = {
+                let mut tail = last.text.chars().rev();
+                tail.next() == Some('-') && tail.next().is_some_and(char::is_alphabetic)
+            };
+            let continues_word = first.text.chars().next().is_some_and(char::is_lowercase);
+            if hyphenated && continues_word {
+                last.text.pop();
+            } else {
+                runs.push(Run {
+                    text: "\n".to_string(),
+                    style: FontStyle::default(),
+                    link: None,
+                });
+            }
+        }
+        for run in next {
+            push_text(&mut runs, &run.text, run.style, run.link);
+        }
+    }
+    runs
+}
+
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -523,7 +590,12 @@ mod tests {
             body("and wraps here.", 658.0),
             body("Second paragraph after a gap.", 630.0),
         ];
-        let blocks = build(vec![PageLines::Lines(lines)]);
+        let blocks = build(
+            vec![PageItems::Items(
+                lines.into_iter().map(Item::Line).collect(),
+            )],
+            &mut |_, _| Block::Rule,
+        );
         assert!(matches!(&blocks[0], Block::Heading { level: 1, runs } if text(runs) == "Title"));
         assert!(
             matches!(&blocks[1], Block::Paragraph(r) if text(r) == "first line of a paragraph that keeps going and wraps here.")
@@ -536,7 +608,12 @@ mod tests {
     #[test]
     fn hyphenated_line_ends_are_rejoined() {
         let lines = vec![body("an exam-", 700.0), body("ple of it", 688.0)];
-        let blocks = build(vec![PageLines::Lines(lines)]);
+        let blocks = build(
+            vec![PageItems::Items(
+                lines.into_iter().map(Item::Line).collect(),
+            )],
+            &mut |_, _| Block::Rule,
+        );
         assert!(matches!(&blocks[0], Block::Paragraph(r) if text(r) == "an example of it"));
     }
 
@@ -547,7 +624,12 @@ mod tests {
             line("continued", 82.0, 688.0, 10.0, FontStyle::default()),
             body("2. two", 676.0),
         ];
-        let blocks = build(vec![PageLines::Lines(lines)]);
+        let blocks = build(
+            vec![PageItems::Items(
+                lines.into_iter().map(Item::Line).collect(),
+            )],
+            &mut |_, _| Block::Rule,
+        );
         assert!(
             matches!(&blocks[0], Block::ListItem { number: None, runs, .. } if text(runs) == "one continued")
         );
@@ -561,7 +643,12 @@ mod tests {
         let full =
             "1. a numbered paragraph whose first line runs to the right margin of the column";
         let lines = vec![body(full, 700.0), body("and wraps flush left.", 688.0)];
-        let blocks = build(vec![PageLines::Lines(lines)]);
+        let blocks = build(
+            vec![PageItems::Items(
+                lines.into_iter().map(Item::Line).collect(),
+            )],
+            &mut |_, _| Block::Rule,
+        );
         assert_eq!(blocks.len(), 1);
         assert!(
             matches!(&blocks[0], Block::ListItem { runs, .. } if text(runs).ends_with("flush left."))
@@ -580,7 +667,12 @@ mod tests {
             line("    call();", 72.0, 688.0, 10.0, mono),
             line("}", 72.0, 676.0, 10.0, mono),
         ];
-        let blocks = build(vec![PageLines::Lines(lines)]);
+        let blocks = build(
+            vec![PageItems::Items(
+                lines.into_iter().map(Item::Line).collect(),
+            )],
+            &mut |_, _| Block::Rule,
+        );
         assert_eq!(
             blocks[1],
             Block::Code("fn main() {\n    call();\n}".to_string())
@@ -598,7 +690,12 @@ mod tests {
             line(long, 72.0, 700.0, 10.0, FontStyle::default()),
             line("example.com/path", 72.0, 688.0, 10.0, mono),
         ];
-        let blocks = build(vec![PageLines::Lines(lines)]);
+        let blocks = build(
+            vec![PageItems::Items(
+                lines.into_iter().map(Item::Line).collect(),
+            )],
+            &mut |_, _| Block::Rule,
+        );
         assert_eq!(blocks.len(), 1);
         assert!(
             matches!(&blocks[0], Block::Paragraph(runs) if runs.last().is_some_and(|r| r.style.mono))
@@ -607,7 +704,7 @@ mod tests {
 
     #[test]
     fn failed_pages_leave_a_comment() {
-        let blocks = build(vec![PageLines::Failed(2)]);
+        let blocks = build(vec![PageItems::Failed(2)], &mut |_, _| Block::Rule);
         assert_eq!(
             blocks,
             [Block::Comment("page 2: extraction failed".to_string())]

@@ -1,13 +1,18 @@
-//! Geometry pass: glyphs → line segments → reading-ordered lines.
+//! Geometry pass: glyphs → line segments → reading-ordered items.
 //!
-//! Glyphs are clustered into baselines, baselines split into segments at wide
-//! horizontal gaps, repeated page furniture (running headers/footers, page
-//! numbers) dropped, and two-column pages linearised column by column.
+//! Ruled tables are taken out first, remaining glyphs clustered into
+//! baselines, baselines split into segments at wide horizontal gaps, repeated
+//! page furniture (running headers/footers, page numbers, logos) dropped, and
+//! two-column pages linearised column by column. Tables, images and rules
+//! join the reading order by their bounding boxes.
 
 use std::collections::HashMap;
 
-use crate::interp::Glyph;
+use lopdf::ObjectId;
+
+use crate::interp::{Glyph, ImageSource, Ruling};
 use crate::page::Page;
+use crate::tables::{self, Piece, Table};
 
 /// Baseline clustering tolerance, as a fraction of the font size.
 const BASELINE_TOLERANCE: f32 = 0.45;
@@ -17,6 +22,10 @@ const SEGMENT_GAP: f32 = 1.5;
 const FURNITURE_BAND: f32 = 0.08;
 /// Minimum gutter width (pt) for two-column detection.
 const MIN_GUTTER: f32 = 6.0;
+/// A horizontal rule must span at least this share of the page width.
+const MIN_RULE_WIDTH: f32 = 0.4;
+/// Fewest consecutive aligned lines that make a borderless table.
+const MIN_ALIGNED_ROWS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Column {
@@ -44,6 +53,41 @@ pub struct Line {
     pub column_width: f32,
 }
 
+/// A reading-ordered page element.
+#[derive(Debug, Clone)]
+pub enum Item {
+    Line(Line),
+    /// `index` into the page's [`Page::images`].
+    Image {
+        page: u32,
+        index: usize,
+    },
+    Table {
+        page: u32,
+        table: Table,
+    },
+    Rule {
+        page: u32,
+    },
+}
+
+impl Item {
+    pub fn page(&self) -> u32 {
+        match self {
+            Self::Line(line) => line.page,
+            Self::Image { page, .. } | Self::Table { page, .. } | Self::Rule { page } => *page,
+        }
+    }
+}
+
+/// A non-text page element waiting for its place in the reading order.
+#[derive(Debug)]
+enum Thing {
+    Image(usize),
+    Table(Table),
+    Rule,
+}
+
 #[derive(Debug, Clone)]
 struct Segment {
     baseline: usize,
@@ -52,6 +96,10 @@ struct Segment {
     x1: f32,
     y: f32,
     size: f32,
+    /// Lowest y covered (the baseline for text, the box bottom for things).
+    bottom: f32,
+    /// Index into the page's things when this stands for a non-text element.
+    thing: Option<usize>,
 }
 
 impl Segment {
@@ -74,7 +122,23 @@ impl Segment {
             x1,
             y,
             size,
+            bottom: y,
+            thing: None,
         })
+    }
+
+    /// Placeholder for a non-text element occupying `bbox`.
+    fn thing(index: usize, [x0, y0, x1, y1]: [f32; 4], size: f32) -> Self {
+        Self {
+            baseline: usize::MAX - index,
+            glyphs: Vec::new(),
+            x0,
+            x1,
+            y: y1,
+            size,
+            bottom: y0,
+            thing: Some(index),
+        }
     }
 
     fn text(&self) -> String {
@@ -102,22 +166,63 @@ pub fn half_points(size: f32) -> i32 {
     (size * 2.0).round() as i32
 }
 
-/// Lays out all pages into one reading-ordered list of lines.
-pub fn lines(pages: &[Page], keep_furniture: bool) -> Vec<Line> {
-    let mut segmented: Vec<(&Page, Vec<Segment>)> =
-        pages.iter().map(|page| (page, segments(page))).collect();
+/// Lays out all pages into one reading-ordered list of items.
+pub fn items(pages: &[Page], keep_furniture: bool) -> Vec<Item> {
+    let mut segmented: Vec<(&Page, Vec<Segment>)> = Vec::new();
+    let mut things: Vec<Vec<(Thing, [f32; 4])>> = Vec::new();
+    for page in pages {
+        let ruled = tables::ruled(&page.rulings, page.glyphs.clone());
+        let mut page_things: Vec<(Thing, [f32; 4])> = ruled
+            .tables
+            .into_iter()
+            .map(|t| (t.bbox, Thing::Table(t)))
+            .map(|(bbox, t)| (t, bbox))
+            .collect();
+        page_things.extend(
+            rules(page, &ruled.loose)
+                .into_iter()
+                .map(|b| (Thing::Rule, b)),
+        );
+        page_things.extend(
+            page.images
+                .iter()
+                .enumerate()
+                .map(|(i, image)| (Thing::Image(i), image.bbox)),
+        );
+        segmented.push((page, segments(&ruled.glyphs)));
+        things.push(page_things);
+    }
     if !keep_furniture {
         strip_furniture(&mut segmented);
+        strip_furniture_things(&segmented, &mut things);
     }
     segmented
         .into_iter()
-        .flat_map(|(page, segments)| page_lines(page, segments))
+        .zip(things)
+        .flat_map(|((page, segments), things)| page_items(page, segments, things))
         .collect()
 }
 
-fn segments(page: &Page) -> Vec<Segment> {
-    let mut glyphs: Vec<&Glyph> = page
-        .glyphs
+/// Long horizontal rulings that no text sits on (underlines, strike-throughs).
+fn rules(page: &Page, loose: &[Ruling]) -> Vec<[f32; 4]> {
+    let width = page.bbox[2] - page.bbox[0];
+    loose
+        .iter()
+        .filter(|r| r.to - r.from >= MIN_RULE_WIDTH * width)
+        .filter(|r| {
+            !page.glyphs.iter().any(|g| {
+                g.x < r.to
+                    && g.x + g.width > r.from
+                    && r.pos >= g.y - 0.3 * g.size
+                    && r.pos <= g.y + g.size
+            })
+        })
+        .map(|r| [r.from, r.pos, r.to, r.pos])
+        .collect()
+}
+
+fn segments(glyphs: &[Glyph]) -> Vec<Segment> {
+    let mut glyphs: Vec<&Glyph> = glyphs
         .iter()
         .filter(|g| !g.text.trim().is_empty() && g.size > 0.0)
         .collect();
@@ -192,8 +297,54 @@ fn dedupe_overprint(glyphs: &mut Vec<Glyph>) {
 }
 
 fn band(page: &Page, segment: &Segment) -> bool {
-    let relative = (segment.y - page.bbox[1]) / page.height().max(1.0);
+    in_band(page, segment.y)
+}
+
+fn in_band(page: &Page, y: f32) -> bool {
+    let relative = (y - page.bbox[1]) / page.height().max(1.0);
     !(FURNITURE_BAND..=1.0 - FURNITURE_BAND).contains(&relative)
+}
+
+/// Drops rules in the header/footer bands, and images repeated there (same
+/// `XObject`) on at least half the pages, like repeated text.
+fn strip_furniture_things(pages: &[(&Page, Vec<Segment>)], things: &mut [Vec<(Thing, [f32; 4])>]) {
+    let in_band_box = |page: &Page, [_, y0, _, y1]: [f32; 4]| in_band(page, f32::midpoint(y0, y1));
+    let object = |page: &Page, thing: &Thing| match thing {
+        Thing::Image(i) => match page.images.get(*i).map(|image| &image.source) {
+            Some(ImageSource::Object(id)) => Some(*id),
+            _ => None,
+        },
+        _ => None,
+    };
+    let mut seen: HashMap<ObjectId, usize> = HashMap::new();
+    for ((page, _), page_things) in pages.iter().zip(things.iter()) {
+        let mut ids: Vec<ObjectId> = page_things
+            .iter()
+            .filter(|(_, bbox)| in_band_box(page, *bbox))
+            .filter_map(|(thing, _)| object(page, thing))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        for id in ids {
+            *seen.entry(id).or_default() += 1;
+        }
+    }
+    let threshold = (pages.len() / 2).max(2);
+    let enough_pages = pages.len() >= 3;
+    for ((page, _), page_things) in pages.iter().zip(things.iter_mut()) {
+        page_things.retain(|(thing, bbox)| {
+            if !in_band_box(page, *bbox) {
+                return true;
+            }
+            match thing {
+                Thing::Rule => false,
+                Thing::Image(_) => !object(page, thing).is_some_and(|id| {
+                    enough_pages && seen.get(&id).is_some_and(|n| *n >= threshold)
+                }),
+                Thing::Table(_) => true,
+            }
+        });
+    }
 }
 
 /// Normalised furniture key: digits collapsed so "Page 3" ≡ "Page 12".
@@ -335,10 +486,10 @@ fn column_groups(segments: Vec<Segment>) -> Vec<Group> {
         let ys = segments
             .iter()
             .filter(|s| keep(s, g))
-            .map(|s| (s.y, s.size));
-        ys.fold(None, |acc: Option<(f32, f32)>, (y, size)| {
-            let (lo, hi) = acc.unwrap_or((y, y));
-            Some((lo.min(y - 1.5 * size), hi.max(y + 1.5 * size)))
+            .map(|s| (s.bottom, s.y, s.size));
+        ys.fold(None, |acc: Option<(f32, f32)>, (bottom, top, size)| {
+            let (lo, hi) = acc.unwrap_or((bottom, top));
+            Some((lo.min(bottom - 1.5 * size), hi.max(top + 1.5 * size)))
         })
     };
     let left_band = band(|s, g| s.x1 <= g);
@@ -357,8 +508,8 @@ fn column_groups(segments: Vec<Segment>) -> Vec<Group> {
             _ => Column::Full,
         };
         last = match column {
-            Column::Left => [Some((s.y, s.size)), last[1]],
-            Column::Right => [last[0], Some((s.y, s.size))],
+            Column::Left => [Some((s.bottom, s.size)), last[1]],
+            Column::Right => [last[0], Some((s.bottom, s.size))],
             Column::Full => [None, None],
         };
         column
@@ -410,38 +561,153 @@ fn reading_order(groups: Vec<Group>) -> Vec<(usize, Group)> {
     ordered
 }
 
-fn page_lines(page: &Page, segments: Vec<Segment>) -> Vec<Line> {
-    let ordered = reading_order(column_groups(segments));
-    let mut lines: Vec<Line> = ordered
-        .into_iter()
-        .filter_map(|(region, (column, group))| {
-            let glyphs: Vec<Glyph> = group.into_iter().flat_map(|s| s.glyphs).collect();
-            let segment = Segment::new(0, glyphs)?;
-            Some(Line {
-                page: page.number,
-                column,
-                region,
-                x0: segment.x0,
-                x1: segment.x1,
-                y: segment.y,
-                size: segment.size,
-                glyphs: segment.glyphs,
-                column_x1: 0.0,
-                column_width: 0.0,
-            })
-        })
-        .collect();
-
+/// Replaces runs of ≥ 3 consecutive lines of one column, each split into
+/// ≥ 2 segments whose gaps line up, with a borderless table.
+fn alignment_tables(
+    groups: Vec<Group>,
+    things: &mut Vec<Option<(Thing, [f32; 4])>>,
+    size: f32,
+) -> Vec<Group> {
+    let is_row = |group: &Group| group.1.len() >= 2 && group.1.iter().all(|s| s.thing.is_none());
+    let mut runs: Vec<Vec<usize>> = Vec::new();
     for column in [Column::Full, Column::Left, Column::Right] {
-        let members = lines.iter().filter(|l| l.column == column);
-        let x0 = members.clone().map(|l| l.x0).fold(f32::MAX, f32::min);
-        let x1 = members.map(|l| l.x1).fold(f32::MIN, f32::max);
-        for line in lines.iter_mut().filter(|l| l.column == column) {
-            line.column_x1 = x1;
-            line.column_width = (x1 - x0).max(1.0);
+        let mut run: Vec<usize> = Vec::new();
+        for (i, group) in groups.iter().enumerate().filter(|(_, g)| g.0 == column) {
+            let regular = run.last().and_then(|&j| groups.get(j)).is_some_and(|prev| {
+                let (a, b) = (prev.1.first(), group.1.first());
+                a.zip(b).is_some_and(|(a, b)| {
+                    let gap = a.y - b.y;
+                    gap > 0.0 && gap <= 2.5 * a.size.max(b.size)
+                })
+            });
+            if !is_row(group) || (!run.is_empty() && !regular) {
+                runs.push(std::mem::take(&mut run));
+            }
+            if is_row(group) {
+                run.push(i);
+            }
+        }
+        runs.push(run);
+    }
+
+    let mut replaced: HashMap<usize, Option<Group>> = HashMap::new();
+    for run in runs.into_iter().filter(|r| r.len() >= MIN_ALIGNED_ROWS) {
+        let rows: Vec<Vec<Piece>> = run
+            .iter()
+            .filter_map(|&i| groups.get(i))
+            .map(|(_, segments)| {
+                segments
+                    .iter()
+                    .map(|s| Piece {
+                        x0: s.x0,
+                        x1: s.x1,
+                        glyphs: s.glyphs.clone(),
+                    })
+                    .collect()
+            })
+            .collect();
+        let misses = usize::from(rows.len() >= 4);
+        let Some(table) =
+            tables::aligned(&rows, 1.0, misses, true).filter(|t| !tables::looks_like_columns(t))
+        else {
+            continue;
+        };
+        let column = run
+            .first()
+            .and_then(|&i| groups.get(i))
+            .map_or(Column::Full, |g| g.0);
+        let bbox = table.bbox;
+        things.push(Some((Thing::Table(table), bbox)));
+        let placeholder = Segment::thing(things.len() - 1, bbox, size);
+        for (k, &i) in run.iter().enumerate() {
+            replaced.insert(i, (k == 0).then(|| (column, vec![placeholder.clone()])));
         }
     }
-    lines
+    groups
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, group)| match replaced.remove(&i) {
+            Some(replacement) => replacement,
+            None => Some(group),
+        })
+        .collect()
+}
+
+fn page_items(
+    page: &Page,
+    mut segments: Vec<Segment>,
+    things: Vec<(Thing, [f32; 4])>,
+) -> Vec<Item> {
+    let size = match dominant_size(&page.glyphs) {
+        s if s > 0.0 => s,
+        _ => 10.0,
+    };
+    // Things join the top-down segment order by the top of their box.
+    for (index, (_, bbox)) in things.iter().enumerate() {
+        let placeholder = Segment::thing(index, *bbox, size);
+        let at = segments
+            .iter()
+            .position(|s| s.thing.is_none() && s.y < placeholder.y)
+            .unwrap_or(segments.len());
+        segments.insert(at, placeholder);
+    }
+    let mut things: Vec<Option<(Thing, [f32; 4])>> = things.into_iter().map(Some).collect();
+    let groups = alignment_tables(column_groups(segments), &mut things, size);
+    let ordered = reading_order(groups);
+
+    let mut items: Vec<Item> = Vec::new();
+    for (region, (column, group)) in ordered {
+        if let Some(index) = group.first().and_then(|s| s.thing) {
+            let item = match things.get_mut(index).and_then(Option::take) {
+                Some((Thing::Image(index), _)) => Item::Image {
+                    page: page.number,
+                    index,
+                },
+                Some((Thing::Table(table), _)) => Item::Table {
+                    page: page.number,
+                    table,
+                },
+                Some((Thing::Rule, _)) => Item::Rule { page: page.number },
+                None => continue,
+            };
+            items.push(item);
+            continue;
+        }
+        let glyphs: Vec<Glyph> = group.into_iter().flat_map(|s| s.glyphs).collect();
+        let Some(segment) = Segment::new(0, glyphs) else {
+            continue;
+        };
+        items.push(Item::Line(Line {
+            page: page.number,
+            column,
+            region,
+            x0: segment.x0,
+            x1: segment.x1,
+            y: segment.y,
+            size: segment.size,
+            glyphs: segment.glyphs,
+            column_x1: 0.0,
+            column_width: 0.0,
+        }));
+    }
+
+    for column in [Column::Full, Column::Left, Column::Right] {
+        let members = items.iter().filter_map(|item| match item {
+            Item::Line(l) if l.column == column => Some(l),
+            _ => None,
+        });
+        let x0 = members.clone().map(|l| l.x0).fold(f32::MAX, f32::min);
+        let x1 = members.map(|l| l.x1).fold(f32::MIN, f32::max);
+        for item in &mut items {
+            if let Item::Line(line) = item
+                && line.column == column
+            {
+                line.column_x1 = x1;
+                line.column_width = (x1 - x0).max(1.0);
+            }
+        }
+    }
+    items
 }
 
 #[cfg(test)]
@@ -470,7 +736,19 @@ mod tests {
             number,
             bbox: [0.0, 0.0, 612.0, 792.0],
             glyphs: words.iter().flat_map(|(t, x, y)| word(t, *x, *y)).collect(),
+            rulings: Vec::new(),
+            images: Vec::new(),
         }
+    }
+
+    fn lines(pages: &[Page], keep: bool) -> Vec<Line> {
+        items(pages, keep)
+            .into_iter()
+            .filter_map(|item| match item {
+                Item::Line(line) => Some(line),
+                _ => None,
+            })
+            .collect()
     }
 
     fn texts(lines: &[Line]) -> Vec<String> {

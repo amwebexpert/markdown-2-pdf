@@ -39,7 +39,8 @@ The [WebToolBox](https://amwebexpert.github.io/etoolbox/#/markdown-composer) web
   unmodified.
 - [`pdf2md-core/`](pdf2md-core/) — the reverse direction: PDF parsing via
   `lopdf`, a minimal content-stream interpreter and layout heuristics that
-  rebuild GitHub-flavored Markdown. No I/O.
+  rebuild GitHub-flavored Markdown (tables included); images come back as
+  in-memory assets (PNG via `png`). No I/O.
 - [`cli/`](cli/) — `md2pdf` binary (`clap`), reads a `.md` file, writes a `.pdf` file;
   plus the `pdf2md` binary for the reverse direction.
 - [`wasm/`](wasm/) — `wasm-bindgen` wrapper exposing `convert(path)` to JS. This is
@@ -98,6 +99,12 @@ pagination). Example PDFs are not committed; see [`.gitignore`](.gitignore).
 - Convert: `just pdf2md paper.pdf` — output defaults to the input path with a `.md`
   extension. Flags: `-o out.md`, `--pages 3` or `--pages 2-5` (1-based, inclusive),
   `--keep-headers` (keep running headers, footers and page numbers).
+- Images: by default written to `<output stem>_assets/` next to the Markdown
+  (`paper.md` + `paper_assets/img-001.png`, relative links); the folder is only
+  created when there is at least one image, and existing files with the same
+  name are overwritten. `--assets-dir PATH` picks another folder (relative to
+  the output file's folder); `--images inline` embeds `data:` URIs instead and
+  writes no files.
 - Pages whose content cannot be parsed are replaced by an
   `<!-- page N: extraction failed -->` comment and reported on stderr; the rest of
   the document is still converted.
@@ -115,15 +122,22 @@ column by column, then rebuilds Markdown blocks:
 | `**bold**`, `*italic*`, `` `code` `` | Font names, font descriptor flags, and equal glyph widths for monospace faces. |
 | `[text](url)` | URI link annotations over the text. |
 | Fenced code blocks | Runs of monospace lines; indentation recovered from glyph positions. |
+| GFM tables | Drawn rulings first: cell grids (borders, line grids) and rule-only "booktabs" tables (top/mid/bottom rules); otherwise ≥ 3 lines whose text columns line up. Column alignment (`:--`, `:-:`, `--:`) from where cell text sits; multi-line cells joined with `<br>`; the first row is the header. |
+| `![](img-001.png)` | Raster image XObjects and inline images: JPEG copied as is, other bitmaps re-encoded as PNG (alpha from the soft mask). An image drawn several times (a logo) is stored once; one repeated in the header/footer band is dropped like repeated text. |
+| `---` | A long horizontal line with no text on it. |
 
 Tests: [`pdf2md-core/tests/`](pdf2md-core/tests/) round-trips Markdown through
 md2pdf and back (exact match for supported constructs) and snapshots output for
 PDFs from other producers (Chrome, REVTeX/arXiv) — provenance and licences in
 [`pdf2md-core/tests/fixtures/README.md`](pdf2md-core/tests/fixtures/README.md).
 
-Limitations (phase 1): tables come out as plain paragraphs and images are skipped
-(both planned next); scanned PDFs (no text layer) and password-protected files
-are not supported; rotated text, vector figures and math are not reconstructed;
+Limitations: scanned PDFs (no text layer) and password-protected files are not
+supported; rotated text, vector figures/charts and math are not reconstructed
+(vector drawings are not rasterised); `JPXDecode` / `CCITTFaxDecode` /
+`JBIG2Decode` images become an `<!-- unsupported image (…) -->` comment; image
+alt text stays empty; tables are GFM only, so spanning cells are flattened (text
+in the first cell) and a table split across pages stays two tables; borderless
+tables are detected conservatively (a missed table is preferred to a false one);
 a hyphen at a line end followed by a lowercase word is always treated as
 hyphenation (`document-level` → `documentlevel`).
 

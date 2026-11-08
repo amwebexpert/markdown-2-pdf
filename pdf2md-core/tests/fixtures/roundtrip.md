@@ -31,3 +31,13 @@ fn main() {
 ##### Fine print
 
 Escaped characters such as 2 \* 3 or x \_ y survive the trip.
+
+| Name | Role | Notes |
+| :-- | :-: | --: |
+| Ada | Engineer | Loves *long* variable names |
+| Grace | Admiral | `COBOL` pioneer |
+| Alan | Mathematician | See [bio](https://example.com/alan) |
+
+---
+
+Tables and rules close the document.
