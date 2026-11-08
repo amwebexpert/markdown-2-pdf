@@ -1,12 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["core", "cli", "wasm"]
+members = ["core", "cli", "wasm", "pdf2md-core"]
 
 [workspace.package]
 version = "0.1.3"
 edition = "2024"
 license = "MIT"
-description = "Markdown to PDF conversion (Rust core, CLI, and WASM)"
+description = "Markdown to PDF and PDF to Markdown conversion (Rust core, CLI, and WASM)"
 homepage = "https://github.com/amwebexpert/markdown-2-pdf"
 repository = "https://github.com/amwebexpert/markdown-2-pdf"
 keywords = ["markdown", "pdf", "wasm", "webassembly", "opfs"]
@@ -16,6 +16,8 @@ pulldown-cmark = "0.13"
 thiserror = "2"
 anyhow = "1"
 printpdf = { version = "0.12", default-features = false }
+# Same version printpdf already pulls in, without the rayon/chrono defaults (WASM-friendly).
+lopdf = { version = "0.44", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

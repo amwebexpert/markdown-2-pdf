@@ -5,11 +5,11 @@ default:
 
 # --- Build ---
 
-# Debug-build the native CLI (`target/debug/md2pdf`).
+# Debug-build the native CLIs (`target/debug/md2pdf`, `target/debug/pdf2md`).
 build-cli:
     cargo build -p md2pdf
 
-# Release-build the native CLI.
+# Release-build the native CLIs.
 build-cli-release:
     cargo build -p md2pdf --release
 
@@ -34,6 +34,16 @@ examples:
     for f in cli/examples/*.md; do
       cargo run -p md2pdf -- convert "$f"
     done
+
+# --- CLI pdf2md ---
+
+# Convert a PDF file to Markdown; output defaults to same path with `.md`.
+pdf2md input *FLAGS='':
+    cargo run -p md2pdf --bin pdf2md -- {{input}} {{FLAGS}}
+
+# Rewrite pdf2md snapshot files (`pdf2md-core/tests/snapshots/`) to current output; review the diff.
+snapshots:
+    INSTA_UPDATE=always cargo test -p pdf2md-core
 
 # --- Demo ---
 

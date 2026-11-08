@@ -5,6 +5,7 @@ demo/dist/
 demo/*.tsbuildinfo
 *.pdf
 !cli/examples/*.pdf
+!pdf2md-core/tests/fixtures/**/*.pdf
 .DS_Store
 cli/examples/kitchen-sink.pdf
 cli/examples/nested-and-long.pdf

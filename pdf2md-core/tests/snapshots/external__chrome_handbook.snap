@@ -1,0 +1,39 @@
+---
+source: pdf2md-core/tests/external.rs
+expression: md
+---
+# Survey handbook
+
+This handbook explains how the **field team** records *observations*, where the [shared register](https://example.org/register) lives, and which `tools` to use.
+
+## Before you leave
+
+- Charge the GPS receiver
+- Pack the notebook and two pencils
+  - graphite, not ink
+  - a spare eraser
+- Tell the coordinator your route
+
+### Checklist command
+
+```
+survey check --route north
+  --notify coordinator@example.org
+```
+
+## Writing notes
+
+1. Field notes are written quickly and read slowly, so their layout matters more than it seems. Each observation is dated, located and signed, then copied into the shared register at the end of the week. Field notes are written quickly and read slowly, so their layout matters more than it seems. Each observation is dated, located and signed, then copied into the shared register at the end of the week.
+2. Field notes are written quickly and read slowly, so their layout matters more than it seems. Each observation is dated, located and signed, then copied into the shared register at the end of the week. Field notes are written quickly and read slowly, so their layout matters more than it seems. Each observation is dated, located and signed, then copied into the shared register at the end of the week.
+3. Field notes are written quickly and read slowly, so their layout matters more than it seems. Each observation is dated, located and signed, then copied into the shared register at the end of the week. Field notes are written quickly and read slowly, so their layout matters more than it seems. Each observation is dated, located and signed, then copied into the shared register at the end of the week.
+4. Field notes are written quickly and read slowly, so their layout matters more than it seems. Each observation is dated, located and signed, then copied into the shared register at the end of the week. Field notes are written quickly and read slowly, so their layout matters more than it seems. Each observation is dated, located and signed, then copied into the shared register at the end of the week.
+5. Field notes are written quickly and read slowly, so their layout matters more than it seems. Each observation is dated, located and signed, then copied into the shared register at the end of the week. Field notes are written quickly and read slowly, so their layout matters more than it seems. Each observation is dated, located and signed, then copied into the shared register at the end of the week.
+6. Field notes are written quickly and read slowly, so their layout matters more than it seems. Each observation is dated, located and signed, then copied into the shared register at the end of the week. Field notes are written quickly and read slowly, so their layout matters more than it seems. Each observation is dated, located and signed, then copied into the shared register at the end of the week.
+7. Field notes are written quickly and read slowly, so their layout matters more than it seems. Each observation is dated, located and signed, then copied into the shared register at the end of the week. Field notes are written quickly and read slowly, so their layout matters more than it seems. Each observation is dated, located and signed, then copied into the shared register at the end of the week.
+8. Field notes are written quickly and read slowly, so their layout matters more than it seems. Each observation is dated, located and signed, then copied into the shared register at the end of the week. Field notes are written quickly and read slowly, so their layout matters more than it seems. Each observation is dated, located and signed, then copied into the shared register at the end of the week.
+
+## Returning
+
+1. Copy the notes into the register
+2. Return the equipment
+3. File the expenses
