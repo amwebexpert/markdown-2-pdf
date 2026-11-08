@@ -43,8 +43,9 @@ The [WebToolBox](https://amwebexpert.github.io/etoolbox/#/markdown-composer) web
   in-memory assets (PNG via `png`). No I/O.
 - [`cli/`](cli/) — `md2pdf` binary (`clap`), reads a `.md` file, writes a `.pdf` file;
   plus the `pdf2md` binary for the reverse direction.
-- [`wasm/`](wasm/) — `wasm-bindgen` wrapper exposing `convert(path)` to JS. This is
-  the only crate that touches OPFS; it must run inside a Web Worker (OPFS's
+- [`wasm/`](wasm/) — `wasm-bindgen` wrapper exposing `markdownToPdf(markdown)`
+  (bytes in/out, any JS context) and `convert(path)` to JS. This is the only
+  crate that touches OPFS; `convert` must run inside a Web Worker (OPFS's
   synchronous access handle is worker-only).
 - [`demo/`](demo/) — minimal Vite + TypeScript page exercising the WASM module.
 
@@ -151,7 +152,7 @@ and a `.d.ts`. The demo imports this directly.
 **Note:** `printpdf` (a dependency of `core`) bundles its own `wasm-bindgen`
 API unconditionally for any wasm32 build (`Pdf_HtmlToDocumentSync` and
 friends). These extra exports show up in `md2pdf_wasm.d.ts` alongside our own
-`convert`/`init` — harmless, but not part of this project's API; ignore them.
+`init`/`markdownToPdf`/`convert` — harmless, but not part of this project's API; ignore them.
 They also add to the ~6MB binary size, on top of the embedded Liberation
 fonts (~2.7MB raw, unsubsetted — see [`core/src/fonts.rs`](core/src/fonts.rs)).
 
@@ -196,9 +197,11 @@ generates `package.json` from the wasm crate's `Cargo.toml` and copies
 package page; `description`, `homepage`, `repository`, and `keywords` in
 [`wasm/Cargo.toml`](wasm/Cargo.toml) fill the sidebar (edit [`wasm/README.md`](wasm/README.md) for npm-facing docs).
 
-Consumers install with `npm install @amwebexpert/md2pdf-wasm`, import `init` and `convert`,
-and run the module in a **Web Worker** with **OPFS** (same constraints as the
-demo — see [`demo/src/main.ts`](demo/src/main.ts) and [`demo/src/worker.ts`](demo/src/worker.ts)).
+Consumers install with `npm install @amwebexpert/md2pdf-wasm`, then either call
+`markdownToPdf(markdown)` from any context (main thread or worker), or `convert(path)`
+in a **Web Worker** with **OPFS** — the demo shows both, see
+[`demo/src/main.ts`](demo/src/main.ts) and [`demo/src/worker.ts`](demo/src/worker.ts).
+Bundler notes are in [`wasm/README.md`](wasm/README.md).
 
 ## Demo
 
