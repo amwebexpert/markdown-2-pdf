@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false  # shipped as a binary / npm package, not on crates.io
-description = "Markdown to PDF in the browser (WebAssembly; bytes API or OPFS in a Web Worker)"
+description = "Markdown to PDF and PDF to Markdown in the browser (WebAssembly; bytes API or OPFS in a Web Worker)"
 readme = "README.md"
 homepage.workspace = true
 repository.workspace = true
@@ -15,6 +15,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 md2pdf-core = { path = "../core" }
+pdf2md-core = { path = "../pdf2md-core" }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"

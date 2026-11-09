@@ -1,6 +1,6 @@
 # @amwebexpert/md2pdf-wasm
 
-Markdown → PDF in the browser, compiled from Rust to WebAssembly.
+Markdown → PDF and PDF → Markdown in the browser, compiled from Rust to WebAssembly.
 
 **Source code, CLI, demo, and full documentation:**
 [github.com/amwebexpert/markdown-2-pdf](https://github.com/amwebexpert/markdown-2-pdf)
@@ -32,6 +32,24 @@ link.download = "hello.pdf";
 link.click();
 ```
 
+### PDF bytes → Markdown string (any context)
+
+Works on the main thread or in a Web Worker. Extracted images are embedded as
+base64 `data:` URIs. Born-digital PDFs only (scanned PDFs have no text layer).
+
+```ts
+import init, { pdfToMarkdown } from "@amwebexpert/md2pdf-wasm";
+
+await init(); // once
+
+const pdfBytes = new Uint8Array(await file.arrayBuffer());
+const result = pdfToMarkdown(pdfBytes); // all pages, headers/footers stripped
+console.log(result.markdown, result.pageCount, result.warnings);
+result.free(); // optional: release the WASM-side object early
+
+pdfToMarkdown(pdfBytes, 2, 5, true); // pages 2–5, keep headers/footers
+```
+
 ### OPFS file → OPFS file (Web Worker only)
 
 Reads a Markdown file from the OPFS (Origin Private File System) root, writes
@@ -58,6 +76,10 @@ for a working Vite integration of both modes.
   pass `{ module_or_path }` (URL, `Response`, bytes, or `WebAssembly.Module`) to
   load it from elsewhere.
 - `markdownToPdf(markdown: string): Uint8Array` — PDF bytes. Throws on failure.
+- `pdfToMarkdown(pdf: Uint8Array, firstPage?, lastPage?, keepHeaders?): PdfToMarkdownResult`
+  — `{ markdown, pageCount, warnings }`. Pages are 1-based and inclusive
+  (omit both for every page). Throws on invalid range, unreadable or encrypted
+  PDF.
 - `convert(inputPath: string): Promise<string>` — flat filename at OPFS root;
   resolves to the `.pdf` output filename. Web Worker only.
 
@@ -74,8 +96,8 @@ The package is built with `wasm-pack --target web` (plain ES modules).
   the package files as-is, so the `.wasm` resolves next to it, e.g.
   `import init, { markdownToPdf } from "https://cdn.jsdelivr.net/npm/@amwebexpert/md2pdf-wasm/md2pdf_wasm.js";`.
 
-The `.wasm` is ~6 MB (~3 MB gzipped; fonts are embedded), so call `init()` lazily,
-when the user first needs a PDF.
+The `.wasm` is ~7.5 MB (fonts are embedded), so call `init()` lazily,
+when the user first needs a conversion.
 
 Other `Pdf_*` exports in the type definitions come from the bundled `printpdf`
 dependency and are not part of this package's API.

@@ -1,6 +1,6 @@
-//! wasm-bindgen entry point. [`markdown_to_pdf`] is a plain bytes-in/bytes-out
-//! call usable from any JS context (main thread, worker). [`convert`] must run
-//! inside a Web Worker: OPFS's synchronous access handle
+//! wasm-bindgen entry point. [`markdown_to_pdf`] and [`pdf_to_markdown`] are
+//! plain in-memory calls usable from any JS context (main thread, worker).
+//! [`convert`] must run inside a Web Worker: OPFS's synchronous access handle
 //! (`createSyncAccessHandle`) is only available there, which is why this
 //! module exists separately from `md2pdf-core` — it's the only place
 //! OPFS-specific, worker-only code lives.
@@ -34,6 +34,67 @@ pub fn markdown_to_pdf(markdown: &str) -> Result<Vec<u8>, JsValue> {
     md2pdf_core::convert(markdown)
         .map(|(pdf_bytes, _page_count)| pdf_bytes)
         .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Result of [`pdf_to_markdown`].
+#[wasm_bindgen(getter_with_clone)]
+#[derive(Debug)]
+pub struct PdfToMarkdownResult {
+    /// The Markdown document; images are embedded as `data:` URIs.
+    pub markdown: String,
+    /// Number of pages converted.
+    #[wasm_bindgen(js_name = pageCount)]
+    pub page_count: usize,
+    /// Non-fatal problems, e.g. pages whose content could not be parsed.
+    pub warnings: Vec<String>,
+}
+
+/// Converts PDF bytes to Markdown, embedding extracted images as base64
+/// `data:` URIs. Runs synchronously, so prefer a Web Worker for large
+/// documents. Scanned PDFs (no text layer) are not supported.
+///
+/// `first_page` / `last_page` are 1-based and inclusive; omit both to convert
+/// every page, omit one to leave that end of the range open. `keep_headers`
+/// keeps running headers, footers and page numbers (stripped by default).
+///
+/// # Errors
+///
+/// Throws a JS error if the page range is invalid, the bytes are not a
+/// readable PDF, the document is encrypted, or the range selects no page.
+#[wasm_bindgen(js_name = pdfToMarkdown)]
+pub fn pdf_to_markdown(
+    pdf: &[u8],
+    first_page: Option<u32>,
+    last_page: Option<u32>,
+    keep_headers: Option<bool>,
+) -> Result<PdfToMarkdownResult, JsValue> {
+    let options = pdf2md_core::Options {
+        pages: page_range(first_page, last_page)?,
+        keep_headers: keep_headers.unwrap_or(false),
+        images: pdf2md_core::ImageMode::Inline,
+    };
+    let output =
+        pdf2md_core::convert(pdf, &options).map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    Ok(PdfToMarkdownResult {
+        markdown: output.markdown,
+        page_count: output.page_count,
+        warnings: output.warnings,
+    })
+}
+
+fn page_range(first: Option<u32>, last: Option<u32>) -> Result<Option<(u32, u32)>, JsValue> {
+    if first.is_none() && last.is_none() {
+        return Ok(None);
+    }
+    let start = first.unwrap_or(1);
+    let end = last.unwrap_or(u32::MAX);
+    if start == 0 || end < start {
+        return Err(JsValue::from_str(
+            "invalid page range: expected 1 <= firstPage <= lastPage",
+        ));
+    }
+    Ok(Some((start, end)))
 }
 
 /// Reads `input_path` (a flat filename at the OPFS root) as Markdown,
