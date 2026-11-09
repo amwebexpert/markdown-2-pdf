@@ -2,7 +2,7 @@
 
 Markdown → PDF, in Rust, sharable as a native CLI or a WASM module driven from
 a Web Worker via OPFS. The reverse direction, PDF → Markdown, ships as the
-[`pdf2md`](#pdf--markdown-pdf2md) CLI.
+[`pdf2md`](#pdf--markdown-pdf2md) CLI and as the WASM `pdfToMarkdown` export.
 
 **Repository:** [github.com/amwebexpert/markdown-2-pdf](https://github.com/amwebexpert/markdown-2-pdf)
 
@@ -44,7 +44,7 @@ The [WebToolBox](https://amwebexpert.github.io/etoolbox/#/markdown-composer) web
 - [`cli/`](cli/) — `md2pdf` binary (`clap`), reads a `.md` file, writes a `.pdf` file;
   plus the `pdf2md` binary for the reverse direction.
 - [`wasm/`](wasm/) — `wasm-bindgen` wrapper exposing `markdownToPdf(markdown)`
-  (bytes in/out, any JS context) and `convert(path)` to JS. This is the only
+  and `pdfToMarkdown(pdf)` (in-memory, any JS context) and `convert(path)` to JS. This is the only
   crate that touches OPFS; `convert` must run inside a Web Worker (OPFS's
   synchronous access handle is worker-only).
 - [`demo/`](demo/) — minimal Vite + TypeScript page exercising the WASM module.
@@ -152,8 +152,8 @@ and a `.d.ts`. The demo imports this directly.
 **Note:** `printpdf` (a dependency of `core`) bundles its own `wasm-bindgen`
 API unconditionally for any wasm32 build (`Pdf_HtmlToDocumentSync` and
 friends). These extra exports show up in `md2pdf_wasm.d.ts` alongside our own
-`init`/`markdownToPdf`/`convert` — harmless, but not part of this project's API; ignore them.
-They also add to the ~6MB binary size, on top of the embedded Liberation
+`init`/`markdownToPdf`/`pdfToMarkdown`/`convert` — harmless, but not part of this project's API; ignore them.
+They also add to the ~7.5MB binary size (which includes the `pdf2md-core` PDF parser), on top of the embedded Liberation
 fonts (~2.7MB raw, unsubsetted — see [`core/src/fonts.rs`](core/src/fonts.rs)).
 
 ## Bump versions

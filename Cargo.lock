@@ -613,7 +613,7 @@ dependencies = [
 
 [[package]]
 name = "md2pdf"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -623,7 +623,7 @@ dependencies = [
 
 [[package]]
 name = "md2pdf-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "printpdf",
  "pulldown-cmark",
@@ -632,11 +632,12 @@ dependencies = [
 
 [[package]]
 name = "md2pdf-wasm"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",
  "md2pdf-core",
+ "pdf2md-core",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -767,7 +768,7 @@ dependencies = [
 
 [[package]]
 name = "pdf2md-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "insta",
  "lopdf",
