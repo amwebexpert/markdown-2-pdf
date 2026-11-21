@@ -1,6 +1,28 @@
 # pdf2md — P1-A spec: table reconstruction
 
-Status: ready · Source: `improvements.md` §4 · One PR (may split per goal).
+Status: implemented (partly, see below) · Source: `improvements.md` §4 · One
+PR (`feat/pdf2md-tables`).
+
+## As built
+
+- **Goal 1:** `tables::Table` gained `columns` (boundaries), `spans`
+  (`Span { row, col, rows, cols }`) and `evidence` (`Ruled | RuleOnly |
+  Aligned`). Not added: per-cell bboxes, `header_rows` (row 0 is still the
+  header), a numeric score.
+- **Goal 2:** collinear/touch tolerances scale with the median glyph size
+  (0.2/0.4 em, never below 1/2 pt). Partial verticals were already handled
+  by the span union. Decorative-line filtering is not done.
+- **Goal 3:** tightly set booktabs columns are split at the header words. The
+  arXiv Table II snapshot is fixed (4 columns). "Header above the top rule"
+  is not done, because no fixture shows it.
+- **Goal 4:** not a weighted score; there is no fixture corpus to tune one.
+  Instead `tables::verdict` names its rejections: numbered equations are
+  rejected, and sparse near misses are reported as warnings.
+- **Goal 5:** merged cells are recorded and a warning is emitted. The output
+  is unchanged (text in the first cell).
+- **Goal 6:** `continuation.rs` merges tables that span pages, as specified,
+  with one warning per merge. Repeated headers are always dropped.
+- **Goal 7:** warnings cover merged cells, near misses and cross-page merges.
 
 ## Context (current pipeline, `pdf2md-core/src/`)
 
