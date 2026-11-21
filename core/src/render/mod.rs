@@ -39,6 +39,8 @@ const HEADING_SPACING_AFTER: f32 = 6.0;
 /// Room a heading reserves for its section's start: two body lines.
 const HEADING_KEEP_WITH_NEXT: f32 = 2.0 * BODY_LEADING;
 const CODE_SPACING_BEFORE: f32 = 4.0;
+/// Narrowest content width deep nesting may leave (see `Renderer::clamp_x`).
+const MIN_CONTENT_WIDTH: f32 = 144.0;
 /// Widow/orphan control: only paragraphs of this many lines are kept from
 /// leaving fewer than `MIN_LINES_PER_SIDE` lines on either side of a break.
 const MIN_LINES_TO_SPLIT: usize = 4;
@@ -536,6 +538,24 @@ impl<'a> Renderer<'a> {
     /// Takes `height` of the page for something being drawn there and returns
     /// its top. Every drawing primitive goes through this, so the first-line
     /// probe and `content_bottom` stay right.
+    /// Runs `draw` and returns where its first content landed, if it drew
+    /// anything. An enclosing caller waiting for the same first line is
+    /// handed the result too.
+    fn with_first_content(&mut self, draw: impl FnOnce(&mut Self)) -> Option<PagePos> {
+        let outer = std::mem::replace(&mut self.first_content, Probe::Waiting);
+        draw(self);
+        let found = match std::mem::replace(&mut self.first_content, outer) {
+            Probe::Found(at) => Some(at),
+            Probe::Off | Probe::Waiting => None,
+        };
+        if let Some(at) = found
+            && self.first_content == Probe::Waiting
+        {
+            self.first_content = Probe::Found(at);
+        }
+        found
+    }
+
     fn occupy(&mut self, height: f32) -> f32 {
         if self.first_content == Probe::Waiting {
             self.first_content = Probe::Found(self.position());
@@ -682,10 +702,32 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// Renders sibling blocks; a heading looks at the block after it to keep
+    /// itself with that block's start.
+    fn render_blocks(&mut self, blocks: &[Block], x0: f32) {
+        for (i, block) in blocks.iter().enumerate() {
+            self.render_block_before(block, blocks.get(i + 1), x0);
+        }
+    }
+
     fn render_block(&mut self, block: &Block, x0: f32) {
-        let max_width = (PAGE_WIDTH_PT - MARGIN_PT - x0).max(1.0);
+        self.render_block_before(block, None, x0);
+    }
+
+    /// Leftmost x a block may start at: deep nesting stops indenting once
+    /// only `MIN_CONTENT_WIDTH` is left, so content never leaves the page.
+    fn clamp_x(x: f32) -> f32 {
+        x.min(PAGE_WIDTH_PT - MARGIN_PT - MIN_CONTENT_WIDTH)
+    }
+
+    fn render_block_before(&mut self, block: &Block, next: Option<&Block>, x0: f32) {
+        let x0 = Self::clamp_x(x0);
+        let max_width = PAGE_WIDTH_PT - MARGIN_PT - x0;
         match block {
-            Block::Heading { level, spans } => self.render_heading(*level, spans, x0, max_width),
+            Block::Heading { level, spans } => {
+                let keep = self.lead_height(next, max_width);
+                self.render_heading(*level, spans, x0, max_width, keep);
+            }
             Block::Paragraph { spans } => self.render_paragraph(spans, x0, max_width),
             Block::CodeBlock { text } => self.render_code_block(text, x0, max_width),
             Block::List {
@@ -738,55 +780,106 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    fn render_heading(&mut self, level: u8, spans: &[Span], x0: f32, max_width: f32) {
+    /// How much of `next` a heading above it must keep on its page: the table
+    /// header plus first row line, the whole image, or two body lines.
+    fn lead_height(&mut self, next: Option<&Block>, max_width: f32) -> f32 {
+        let lead = match next {
+            Some(Block::Table { header, rows, .. }) => {
+                let num_cols = header
+                    .len()
+                    .max(rows.iter().map(Vec::len).max().unwrap_or(0))
+                    .max(1);
+                let demands = column_demands(&self.fonts, num_cols, header, rows);
+                let widths = column_widths(&demands, max_width);
+                let header = RowLayout::new(&self.fonts, &widths, header, true);
+                TABLE_SPACING_BEFORE + header.height() + row_height(1)
+            }
+            Some(Block::Image(image)) => self
+                .image_extent(image, max_width)
+                .map_or(HEADING_KEEP_WITH_NEXT, |(_, height, caption)| {
+                    height + caption
+                }),
+            _ => HEADING_KEEP_WITH_NEXT,
+        };
+        // Never demand more than half a page, or the heading could end up
+        // alone on a page of its own.
+        lead.min(Self::printable_height() / 2.0)
+    }
+
+    fn render_heading(&mut self, level: u8, spans: &[Span], x0: f32, max_width: f32, keep: f32) {
         let idx = (level as usize).saturating_sub(1).min(5);
         let size = HEADING_SIZES.get(idx).copied().unwrap_or(BODY_SIZE);
         let leading = size * HEADING_LEADING_FACTOR;
         let lines = self.wrap_spans_to_lines(spans, max_width, size, true, &self.fonts.sans_bold);
         // Keep the heading with the start of its section.
         self.ensure_space(
-            HEADING_SPACING_BEFORE
-                + lines.len() as f32 * leading
-                + HEADING_SPACING_AFTER
-                + HEADING_KEEP_WITH_NEXT,
+            HEADING_SPACING_BEFORE + lines.len() as f32 * leading + HEADING_SPACING_AFTER + keep,
         );
         self.space_before(HEADING_SPACING_BEFORE);
         self.render_lines(&lines, x0, size, leading);
         self.cursor_top += HEADING_SPACING_AFTER;
     }
 
-    /// Index of the first line to move to the next page, if the lines don't
-    /// all fit under the cursor. Paragraphs of [`MIN_LINES_TO_SPLIT`]+ lines
-    /// keep at least [`MIN_LINES_PER_SIDE`] lines on each side of the break
-    /// (no orphan at the page bottom, no widow at the next page's top).
-    fn paragraph_break(&self, count: usize, leading: f32) -> Option<usize> {
-        let fit = (1..=count)
+    /// How many of the `count - from` remaining lines to draw on this page.
+    /// Paragraphs of [`MIN_LINES_TO_SPLIT`]+ lines keep at least
+    /// [`MIN_LINES_PER_SIDE`] lines on each side of every break (no orphan at
+    /// a page bottom, no widow at the next page's top).
+    fn lines_for_this_page(&self, from: usize, count: usize, leading: f32) -> usize {
+        let remaining = count - from;
+        let fit = (1..=remaining)
             .take_while(|&n| self.cursor_top + n as f32 * leading <= Self::page_bottom())
             .count();
-        if fit == count {
-            return None;
+        if fit == remaining {
+            return remaining;
         }
-        if count < MIN_LINES_TO_SPLIT {
-            return Some(fit);
+        let mut take = fit;
+        if count >= MIN_LINES_TO_SPLIT {
+            if from == 0 && take < MIN_LINES_PER_SIDE {
+                take = 0;
+            }
+            if remaining - take < MIN_LINES_PER_SIDE {
+                take = remaining.saturating_sub(MIN_LINES_PER_SIDE);
+            }
         }
-        if fit < MIN_LINES_PER_SIDE {
-            return Some(0);
+        // A fresh page always takes at least one line, so this terminates.
+        if take == 0 && self.at_page_top() {
+            take = fit.max(1);
         }
-        Some(fit.min(count - MIN_LINES_PER_SIDE))
+        take
+    }
+
+    /// Draws wrapped lines page by page under the widow/orphan rule; `marker`
+    /// (a list item's) is drawn on the first line, wherever it lands.
+    fn render_flowing_lines(
+        &mut self,
+        lines: &[Vec<Word>],
+        x0: f32,
+        marker: Option<(f32, &Marker)>,
+    ) {
+        let mut from = 0;
+        while from < lines.len() {
+            let take = self.lines_for_this_page(from, lines.len(), BODY_LEADING);
+            for (i, line) in lines.iter().enumerate().skip(from).take(take) {
+                self.ensure_space(BODY_LEADING);
+                let y = self.next_baseline(BODY_LEADING);
+                if i == 0
+                    && let Some((indent, marker)) = marker
+                {
+                    self.draw_list_marker(indent, y, marker);
+                }
+                self.render_line(line, x0, y, BODY_SIZE);
+            }
+            from += take;
+            if from < lines.len() {
+                self.new_page();
+            }
+        }
     }
 
     fn render_paragraph(&mut self, spans: &[Span], x0: f32, max_width: f32) {
         let lines =
             self.wrap_spans_to_lines(spans, max_width, BODY_SIZE, false, &self.fonts.sans_regular);
-        let split = self
-            .paragraph_break(lines.len(), BODY_LEADING)
-            .unwrap_or(lines.len());
-        let (before, after) = lines.split_at(split);
-        self.render_lines(before, x0, BODY_SIZE, BODY_LEADING);
-        if !after.is_empty() && !self.at_page_top() {
-            self.new_page();
-        }
-        self.render_lines(after, x0, BODY_SIZE, BODY_LEADING);
+        self.render_flowing_lines(&lines, x0, None);
         self.cursor_top += PARAGRAPH_SPACING_AFTER;
     }
 
@@ -838,10 +931,15 @@ impl<'a> Renderer<'a> {
 
     fn render_blockquote(&mut self, blocks: &[Block], x0: f32) {
         let quote_x = x0 + BLOCKQUOTE_INDENT;
-        let mark = self.mark();
-        for block in blocks {
-            self.render_block(block, quote_x);
+        let mut mark = self.mark();
+        // The bar starts at the first line, not the gap a child leaves above it.
+        let Some(first) = self.with_first_content(|r| r.render_blocks(blocks, quote_x)) else {
+            return;
+        };
+        if first.page != mark.at.page {
+            mark.op_index = 0;
         }
+        mark.at = first;
         let bar_x = x0 + BLOCKQUOTE_BAR_INSET;
         self.decorate(&mark, |top, bottom| {
             vec![
@@ -883,11 +981,21 @@ impl<'a> Renderer<'a> {
             lines.push(String::new());
         }
         // Start where the first line will be drawn, not on a page it leaves.
-        self.ensure_space(CODE_LEADING + CODE_PADDING);
+        self.ensure_space(CODE_LEADING + 2.0 * CODE_PADDING);
         let mark = self.mark();
         self.cursor_top += CODE_PADDING;
-        for line in &lines {
-            self.ensure_space(CODE_LEADING);
+        for (i, line) in lines.iter().enumerate() {
+            // The last line brings the bottom padding with it.
+            let padding_below = if i + 1 == lines.len() {
+                CODE_PADDING
+            } else {
+                0.0
+            };
+            let page = self.pages.len();
+            self.ensure_space(CODE_LEADING + padding_below);
+            if self.pages.len() != page {
+                self.cursor_top += CODE_PADDING;
+            }
             let y = self.next_baseline(CODE_LEADING);
             let style = TextStyle {
                 code: true,
@@ -986,21 +1094,8 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    fn render_list_continuation_lines(
-        &mut self,
-        lines: impl IntoIterator<Item = impl AsRef<[Word]>>,
-        content_x: f32,
-    ) {
-        for line in lines {
-            let y = self.reserve_list_line_baseline();
-            self.render_line(line.as_ref(), content_x, y, BODY_SIZE);
-        }
-    }
-
     fn render_list_item_blocks(&mut self, blocks: &[Block], content_x: f32) {
-        for block in blocks {
-            self.render_block(block, content_x);
-        }
+        self.render_blocks(blocks, content_x);
     }
 
     fn render_list_item_paragraph_lead(
@@ -1014,13 +1109,11 @@ impl<'a> Renderer<'a> {
     ) {
         let lines =
             self.wrap_spans_to_lines(spans, max_width, BODY_SIZE, false, &self.fonts.sans_regular);
-        let mut lines_iter = lines.iter();
-        if let Some(first_line) = lines_iter.next() {
-            let y = self.reserve_list_line_baseline();
-            self.draw_list_marker(indent, y, marker);
-            self.render_line(first_line, content_x, y, BODY_SIZE);
+        if lines.iter().all(Vec::is_empty) && lines.len() <= 1 {
+            self.render_list_item_marker_only(indent, marker);
+        } else {
+            self.render_flowing_lines(&lines, content_x, Some((indent, marker)));
         }
-        self.render_list_continuation_lines(lines_iter, content_x);
         self.cursor_top += PARAGRAPH_SPACING_AFTER * 0.4;
         self.render_list_item_blocks(rest, content_x);
     }
@@ -1036,21 +1129,15 @@ impl<'a> Renderer<'a> {
         // The marker goes on the block's first line, wherever (and on
         // whichever page) that ends up. An enclosing item may be waiting for
         // the same first line, so its probe is restored afterwards.
-        let outer = std::mem::replace(&mut self.first_content, Probe::Waiting);
-        self.render_block(first, content_x);
-        let first_line = match std::mem::replace(&mut self.first_content, outer) {
-            Probe::Found(at) => at,
-            // A block that drew nothing still gets its marker, on a line of its own.
-            Probe::Off | Probe::Waiting => {
+        let first_line = self
+            .with_first_content(|r| r.render_block(first, content_x))
+            .unwrap_or_else(|| {
+                // A block that drew nothing still gets its marker, on a line of its own.
                 self.ensure_space(BODY_LEADING);
                 let at = self.position();
                 self.occupy(BODY_LEADING);
                 at
-            }
-        };
-        if self.first_content == Probe::Waiting {
-            self.first_content = Probe::Found(first_line);
-        }
+            });
         let saved = std::mem::take(&mut self.ops);
         let baseline = PAGE_HEIGHT_PT - first_line.top - BODY_LEADING * BASELINE_RATIO;
         self.draw_list_marker(indent, baseline, marker);
@@ -1086,6 +1173,7 @@ impl<'a> Renderer<'a> {
     }
 
     fn render_list(&mut self, ordered: bool, start: u64, items: &[ListItem], indent: f32) {
+        let indent = Self::clamp_x(indent + LIST_INDENT) - LIST_INDENT;
         let content_x = indent + LIST_INDENT;
         let max_width = (PAGE_WIDTH_PT - MARGIN_PT - content_x).max(1.0);
 
@@ -1288,13 +1376,8 @@ impl<'a> Renderer<'a> {
         placed
     }
 
-    fn render_image(&mut self, image: &ImageBlock, x0: f32, max_width: f32) {
-        let Some(placed) = self.place_image(&image.src) else {
-            self.render_image_fallback(&image.alt, x0, max_width);
-            return;
-        };
-        let title = image.title.as_str();
-        let caption = if title.is_empty() {
+    fn caption_lines(&self, title: &str, max_width: f32) -> Vec<Vec<Word>> {
+        if title.is_empty() {
             Vec::new()
         } else {
             let span = Span {
@@ -1308,18 +1391,36 @@ impl<'a> Renderer<'a> {
                 false,
                 &self.fonts.sans_italic,
             )
-        };
+        }
+    }
+
+    /// Scale, drawn height and caption height of an embeddable image (`None`
+    /// when it falls back to text). Never upscales; leaves room on the page
+    /// for the caption.
+    fn image_extent(&mut self, image: &ImageBlock, max_width: f32) -> Option<(f32, f32, f32)> {
+        let placed = self.place_image(&image.src)?;
+        let caption = self.caption_lines(&image.title, max_width);
         let caption_height = if caption.is_empty() {
             0.0
         } else {
             CAPTION_GAP + caption.len() as f32 * CAPTION_LEADING
         };
-        let printable_height = Self::printable_height();
-        // Never upscale; keep the caption on the image's page.
         let scale = PT_PER_PX
             .min(max_width / placed.width_px)
-            .min(((printable_height - caption_height) / placed.height_px).max(0.0));
-        let (width, height) = (placed.width_px * scale, placed.height_px * scale);
+            .min(((Self::printable_height() - caption_height) / placed.height_px).max(0.0));
+        Some((scale, placed.height_px * scale, caption_height))
+    }
+
+    fn render_image(&mut self, image: &ImageBlock, x0: f32, max_width: f32) {
+        let (Some(placed), Some((scale, height, caption_height))) = (
+            self.place_image(&image.src),
+            self.image_extent(image, max_width),
+        ) else {
+            self.render_image_fallback(&image.alt, x0, max_width);
+            return;
+        };
+        let caption = self.caption_lines(&image.title, max_width);
+        let width = placed.width_px * scale;
         self.ensure_space(height + caption_height);
         let bottom = PAGE_HEIGHT_PT - (self.occupy(height) + height);
         self.ops.push(Op::UseXobject {
@@ -1374,9 +1475,7 @@ pub fn render(
     images: &Images,
 ) -> Result<(Vec<u8>, usize, Vec<String>), Md2PdfError> {
     let mut renderer = Renderer::new(images)?;
-    for block in blocks {
-        renderer.render_block(block, MARGIN_PT);
-    }
+    renderer.render_blocks(blocks, MARGIN_PT);
     Ok(renderer.finish())
 }
 
@@ -1507,9 +1606,7 @@ mod tests {
 
     fn render_with(blocks: &[Block], images: &Images) -> Rendered {
         let mut renderer = Renderer::new(images).unwrap();
-        for block in blocks {
-            renderer.render_block(block, MARGIN_PT);
-        }
+        renderer.render_blocks(blocks, MARGIN_PT);
         let mut pages: Vec<Vec<Op>> = renderer.pages.iter().map(|p| p.ops.clone()).collect();
         pages.push(renderer.ops);
         Rendered {
@@ -2017,7 +2114,7 @@ mod tests {
     }
 
     #[test]
-    fn header_taller_than_a_page_is_split_and_not_repeated() {
+    fn header_over_half_a_page_is_split_and_not_repeated() {
         let huge: String = (1..=80)
             .map(|i| format!("h{i}"))
             .collect::<Vec<_>>()
@@ -2303,6 +2400,107 @@ mod tests {
             .collect();
         assert_eq!(bullets.len(), 2);
         assert!((bullets[0] - bullets[1]).abs() < 0.01, "{bullets:?}");
+    }
+
+    #[test]
+    fn heading_moves_with_a_following_table() {
+        let mut blocks = filler(26);
+        blocks.push(heading(2, "Table heading"));
+        blocks.push(table(&["Name", "Value"], &numbered_rows(3)));
+        let pages = page_texts(&render_with(&blocks, &Images::new()));
+        let heading_page = pages
+            .iter()
+            .position(|p| p.contains(&"heading".to_string()))
+            .unwrap();
+        assert!(
+            pages[heading_page].contains(&"Name".to_string()),
+            "{pages:?}"
+        );
+    }
+
+    #[test]
+    fn heading_moves_with_a_following_image() {
+        let images = Images::from([("a.png".to_string(), png_bytes(200, 200))]);
+        let mut blocks = filler(22);
+        blocks.push(heading(2, "Figure heading"));
+        blocks.push(image("a.png", ""));
+        let rendered = render_with(&blocks, &images);
+        let heading_page = rendered
+            .pages
+            .iter()
+            .position(|ops| text_runs(ops).iter().any(|r| r.0 == "heading"))
+            .unwrap();
+        assert_eq!(placements(&rendered.pages[heading_page]).len(), 1);
+    }
+
+    #[test]
+    fn every_page_break_in_a_long_paragraph_avoids_a_lone_line() {
+        // 93 lines from the top: 46 + 46 would leave 1 on the third page.
+        let pages = p_lines_per_page(&[lines_paragraph("p", 93)]);
+        assert!(pages.iter().all(|&n| n >= 2), "{pages:?}");
+        assert_eq!(pages.iter().sum::<usize>(), 93);
+    }
+
+    #[test]
+    fn list_item_paragraphs_avoid_lone_lines_too() {
+        let mut blocks = vec![lines_paragraph("f", 41)];
+        let text = (1..=5)
+            .map(|i| format!("p{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        blocks.push(item(vec![paragraph(vec![Span::plain(text)])]));
+        assert_eq!(p_lines_per_page(&blocks), [3, 2]);
+    }
+
+    #[test]
+    fn deeply_nested_content_stays_on_the_page() {
+        let mut quote = table(&["Name"], &[vec!["cell".to_string()]]);
+        let mut list = paragraph(vec![Span::plain("deep")]);
+        for _ in 0..40 {
+            quote = Block::BlockQuote(vec![quote]);
+            list = item(vec![list]);
+        }
+        for block in [quote, list] {
+            let rendered = render_with(&[block], &Images::new());
+            assert_eq!(rendered.pages.len(), 1);
+            let runs = text_runs(&rendered.ops());
+            assert!(!runs.is_empty());
+            for (text, x, _) in runs {
+                assert!(x < PAGE_WIDTH_PT - MARGIN_PT, "{text} at x {x}");
+            }
+        }
+    }
+
+    #[test]
+    fn code_background_padding_stays_inside_the_margins_and_on_continuations() {
+        for lines in 45..52 {
+            let rendered = render_with(&[code(lines)], &Images::new());
+            for ops in &rendered.pages {
+                let bg = &filled_rects(ops)[0];
+                assert!(bg.y.0 >= MARGIN_PT - 0.01, "{lines} lines: bg below margin");
+                let top_text = text_runs(ops).iter().map(|r| r.2).fold(f32::MIN, f32::max);
+                let top_gap = bg.y.0 + bg.height.0 - (top_text + CODE_SIZE);
+                assert!(
+                    top_gap >= CODE_PADDING,
+                    "{lines} lines: text flush with background top"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blockquote_bar_starts_at_its_first_line_not_the_gap_above_it() {
+        let ops = rendered_ops(&[
+            paragraph(vec![Span::plain("before")]),
+            Block::BlockQuote(vec![heading(3, "quoted")]),
+        ]);
+        let bar_top = lines_drawn(&ops)[0].points[0].p.y.0;
+        let heading_baseline = text_runs(&ops)[1].2;
+        let leading = HEADING_SIZES[2] * HEADING_LEADING_FACTOR;
+        assert!(
+            bar_top - heading_baseline <= leading * BASELINE_RATIO + 0.01,
+            "{bar_top} vs {heading_baseline}"
+        );
     }
 
     #[test]
