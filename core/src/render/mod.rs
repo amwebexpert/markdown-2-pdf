@@ -36,6 +36,9 @@ const HEADING_LEADING_FACTOR: f32 = 1.25;
 const PARAGRAPH_SPACING_AFTER: f32 = 8.0;
 const HEADING_SPACING_BEFORE: f32 = 12.0;
 const HEADING_SPACING_AFTER: f32 = 6.0;
+/// Room a heading reserves for its section's start: two body lines.
+const HEADING_KEEP_WITH_NEXT: f32 = 2.0 * BODY_LEADING;
+const CODE_SPACING_BEFORE: f32 = 4.0;
 const LIST_INDENT: f32 = 18.0;
 const BLOCKQUOTE_INDENT: f32 = 18.0;
 const TABLE_FONT_SIZE: f32 = 10.0;
@@ -745,12 +748,34 @@ impl<'a> Renderer<'a> {
         self.render_paragraph(&[span], x0, max_width);
     }
 
+    /// Vertical gap before a block, dropped at the top of a page.
+    fn space_before(&mut self, gap: f32) {
+        if !self.at_page_top() {
+            self.cursor_top += gap;
+        }
+    }
+
+    /// Starts a new page unless `needed` fits under the cursor (or the
+    /// cursor is already at the top, where waiting would not help).
+    fn keep_together(&mut self, needed: f32) {
+        if !self.at_page_top() && self.cursor_top + needed > Self::page_bottom() {
+            self.new_page();
+        }
+    }
+
     fn render_heading(&mut self, level: u8, spans: &[Span], x0: f32, max_width: f32) {
         let idx = (level as usize).saturating_sub(1).min(5);
         let size = HEADING_SIZES.get(idx).copied().unwrap_or(BODY_SIZE);
         let leading = size * HEADING_LEADING_FACTOR;
-        self.cursor_top += HEADING_SPACING_BEFORE;
         let lines = self.wrap_spans_to_lines(spans, max_width, size, true, &self.fonts.sans_bold);
+        // Keep the heading with the start of its section.
+        self.keep_together(
+            HEADING_SPACING_BEFORE
+                + lines.len() as f32 * leading
+                + HEADING_SPACING_AFTER
+                + HEADING_KEEP_WITH_NEXT,
+        );
+        self.space_before(HEADING_SPACING_BEFORE);
         self.render_lines(&lines, x0, size, leading);
         self.cursor_top += HEADING_SPACING_AFTER;
     }
@@ -770,7 +795,7 @@ impl<'a> Renderer<'a> {
     }
 
     fn render_code_block(&mut self, text: &str, x0: f32, max_width: f32) {
-        self.cursor_top += 4.0;
+        self.space_before(CODE_SPACING_BEFORE);
         let mut any = false;
         for line in text.lines() {
             any = true;
@@ -1006,13 +1031,8 @@ impl<'a> Renderer<'a> {
 
         // Keep the header with the first row (or the first line of it).
         let first = rows.first().map_or(0.0, |r| row_height(r.lines.min(1)));
-        if !self.at_page_top()
-            && self.cursor_top + TABLE_SPACING_BEFORE + header.height() + first
-                > Self::page_bottom()
-        {
-            self.new_page();
-        }
-        self.cursor_top += TABLE_SPACING_BEFORE;
+        self.keep_together(TABLE_SPACING_BEFORE + header.height() + first);
+        self.space_before(TABLE_SPACING_BEFORE);
         if frame.repeat_header {
             self.draw_row_part(&frame, &header, 0..header.lines);
         } else {
@@ -1213,11 +1233,14 @@ impl<'a> Renderer<'a> {
     }
 
     fn finish(mut self) -> (Vec<u8>, usize, Vec<String>) {
-        self.pages.push(PdfPage::new(
-            Mm::from(Pt(PAGE_WIDTH_PT)),
-            Mm::from(Pt(PAGE_HEIGHT_PT)),
-            std::mem::take(&mut self.ops),
-        ));
+        // An empty document still gets one page; nothing else gets a blank one.
+        if !self.ops.is_empty() || self.pages.is_empty() {
+            self.pages.push(PdfPage::new(
+                Mm::from(Pt(PAGE_WIDTH_PT)),
+                Mm::from(Pt(PAGE_HEIGHT_PT)),
+                std::mem::take(&mut self.ops),
+            ));
+        }
         let page_count = self.pages.len();
         self.doc.pages = self.pages;
         let mut warnings = Vec::new();
@@ -1895,6 +1918,53 @@ mod tests {
             .count();
         assert_eq!(header_lines, 80, "header drawn exactly once");
         assert!(pages.iter().flatten().any(|t| t == "body"));
+    }
+
+    fn heading(level: u8, text: &str) -> Block {
+        Block::Heading {
+            level,
+            spans: vec![Span::plain(text)],
+        }
+    }
+
+    fn filler(count: usize) -> Vec<Block> {
+        (0..count)
+            .map(|_| paragraph(vec![Span::plain("x")]))
+            .collect()
+    }
+
+    #[test]
+    fn heading_is_not_stranded_at_the_bottom_of_a_page() {
+        // 27 one-line paragraphs leave 54 pt: enough for the level-2 heading
+        // (12 + 25 pt) but not for the heading plus a line of its section.
+        let mut blocks = filler(27);
+        blocks.push(heading(2, "Section"));
+        blocks.push(paragraph(vec![Span::plain("body")]));
+        let pages = page_texts(&render_with(&blocks, &Images::new()));
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[1], ["Section", "body"]);
+    }
+
+    #[test]
+    fn spacing_before_a_block_is_dropped_at_the_top_of_a_page() {
+        let ops = rendered_ops(&[heading(1, "Title")]);
+        let baseline = text_runs(&ops)[0].2;
+        let leading = HEADING_SIZES[0] * HEADING_LEADING_FACTOR;
+        let expected = PAGE_HEIGHT_PT - MARGIN_PT - leading * BASELINE_RATIO;
+        assert!(
+            (baseline - expected).abs() < 0.01,
+            "{baseline} vs {expected}"
+        );
+    }
+
+    #[test]
+    fn no_empty_page_is_emitted_after_a_page_break() {
+        let images = Images::new();
+        let mut renderer = Renderer::new(&images).unwrap();
+        renderer.render_block(&paragraph(vec![Span::plain("x")]), MARGIN_PT);
+        renderer.new_page();
+        let (_, page_count, _) = renderer.finish();
+        assert_eq!(page_count, 1);
     }
 
     #[test]
