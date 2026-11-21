@@ -10,3 +10,4 @@ demo/*.tsbuildinfo
 cli/examples/kitchen-sink.pdf
 cli/examples/nested-and-long.pdf
 cli/examples/simple.pdf
+cli/examples/features.pdf

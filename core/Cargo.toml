@@ -10,6 +10,7 @@ crate-type = ["lib"]
 [dependencies]
 pulldown-cmark = { workspace = true }
 printpdf = { workspace = true }
+png = "0.18.1"
 thiserror = { workspace = true }
 
 [lints]

@@ -1,42 +1,87 @@
 //! Parses Markdown into the [`crate::ir`] block tree using pulldown-cmark.
 //!
-//! Only `Options::ENABLE_TABLES` is turned on. Everything else CommonMark can
-//! emit without an extension flag (blockquotes, images, thematic breaks, raw
-//! HTML) is handled below; anything gated behind an extension we don't enable
-//! (strikethrough, task lists, footnotes, ...) simply falls through pulldown-cmark
-//! as literal text, which is itself the "best-effort, never fail" fallback.
+//! GFM tables, strikethrough, task lists and footnotes are enabled on top of
+//! CommonMark (blockquotes, images, thematic breaks, raw HTML). Anything gated
+//! behind an extension we don't enable (math, definition lists, super/subscript,
+//! wiki links) simply falls through pulldown-cmark as literal text, which is
+//! itself the "best-effort, never fail" fallback.
 
 mod align;
 mod close;
 mod event;
+mod footnote;
 mod frame;
+mod html;
 mod open;
 mod stack;
 
-use pulldown_cmark::{Options, Parser};
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
 use crate::ir::Block;
 
+use footnote::Footnotes;
 use frame::Frame;
+use stack::{flush_dangling_paragraph, push_span};
 
 pub fn parse(input: &str) -> Vec<Block> {
-    let parser = Parser::new_ext(input, Options::ENABLE_TABLES);
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES;
     let mut stack: Vec<Frame> = vec![Frame::Container(Vec::new())];
+    let mut footnotes = Footnotes::default();
 
-    for event in parser {
-        event::apply_event(&mut stack, event);
+    for event in Parser::new_ext(input, options) {
+        match event {
+            Event::FootnoteReference(label) => push_span(&mut stack, footnotes.reference(&label)),
+            Event::Start(Tag::FootnoteDefinition(label)) => {
+                flush_dangling_paragraph(&mut stack);
+                footnotes.open_definition(&label);
+                stack.push(Frame::Container(Vec::new()));
+            }
+            Event::End(TagEnd::FootnoteDefinition) => {
+                flush_dangling_paragraph(&mut stack);
+                if let Some(Frame::Container(blocks)) = stack.pop() {
+                    footnotes.close_definition(blocks);
+                }
+            }
+            other => event::apply_event(&mut stack, other),
+        }
     }
 
-    match stack.pop() {
+    let mut blocks = match stack.pop() {
         Some(Frame::Container(blocks)) => blocks,
         _ => Vec::new(),
+    };
+    blocks.extend(footnotes.into_endnotes());
+    blocks
+}
+
+/// Sources of the image blocks, deduplicated, in document order.
+pub fn image_sources(blocks: &[Block]) -> Vec<String> {
+    fn walk(blocks: &[Block], out: &mut Vec<String>) {
+        for block in blocks {
+            match block {
+                Block::Image(image) if !out.contains(&image.src) => out.push(image.src.clone()),
+                Block::BlockQuote(inner) => walk(inner, out),
+                Block::List { items, .. } => {
+                    for item in items {
+                        walk(&item.blocks, out);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
+    let mut out = Vec::new();
+    walk(blocks, &mut out);
+    out
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse;
-    use crate::ir::{Align, Block, Span};
+    use super::{image_sources, parse};
+    use crate::ir::{Align, Block, Image, Span};
 
     fn span_text(spans: &[Span]) -> String {
         spans.iter().map(|s| s.text.as_str()).collect()
@@ -104,12 +149,58 @@ mod tests {
     }
 
     #[test]
-    fn image_becomes_bracketed_alt_text() {
-        let blocks = parse("![alt text](http://example.com/x.png)");
+    fn image_alone_in_a_paragraph_becomes_an_image_block() {
+        let blocks = parse("![alt text](img/x.png \"The title\")");
+        assert_eq!(
+            blocks,
+            vec![Block::Image(Image {
+                src: "img/x.png".into(),
+                alt: "alt text".into(),
+                title: "The title".into(),
+                link: None,
+            })]
+        );
+    }
+
+    #[test]
+    fn consecutive_images_each_become_a_block() {
+        let blocks = parse("![a](a.png)\n![b](b.jpg)");
+        let srcs: Vec<&str> = blocks
+            .iter()
+            .map(|b| match b {
+                Block::Image(image) => image.src.as_str(),
+                other => panic!("expected images, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(srcs, ["a.png", "b.jpg"]);
+    }
+
+    #[test]
+    fn image_inside_running_text_keeps_the_alt_text_fallback() {
+        let blocks = parse("see ![alt text](http://example.com/x.png) here");
         match blocks.as_slice() {
-            [Block::Paragraph { spans }] => assert_eq!(span_text(spans), "[image: alt text]"),
+            [Block::Paragraph { spans }] => {
+                assert_eq!(span_text(spans), "see [image: alt text] here");
+            }
             other => panic!("expected one paragraph, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn image_in_a_tight_list_item_becomes_an_image_block() {
+        let blocks = parse("- ![a](a.png)\n");
+        match blocks.as_slice() {
+            [Block::List { items, .. }] => {
+                assert!(matches!(items[0].blocks.as_slice(), [Block::Image(_)]));
+            }
+            other => panic!("expected one list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_sources_lists_block_images_once_in_document_order() {
+        let md = "![a](a.png)\n\n> ![b](b.png)\n\n- ![a](a.png)\n\ntext ![c](c.png) text\n";
+        assert_eq!(image_sources(&parse(md)), ["a.png", "b.png"]);
     }
 
     #[test]
@@ -127,7 +218,7 @@ mod tests {
                 assert_eq!(*start, 1);
                 assert_eq!(items.len(), 2);
                 for (item, text) in items.iter().zip(["one", "two"]) {
-                    match item.as_slice() {
+                    match item.blocks.as_slice() {
                         [Block::Paragraph { spans }] => assert_eq!(span_text(spans), text),
                         other => panic!("expected one paragraph, got {other:?}"),
                     }
@@ -146,6 +237,103 @@ mod tests {
                 assert_eq!(*start, 3);
             }
             other => panic!("expected one list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_list_items_keep_checked_state_and_nesting() {
+        let blocks = parse("- [x] done\n- [ ] todo\n  - [x] nested\n- plain\n");
+        match blocks.as_slice() {
+            [Block::List { items, .. }] => {
+                let tasks: Vec<Option<bool>> = items.iter().map(|i| i.task).collect();
+                assert_eq!(tasks, [Some(true), Some(false), None]);
+                match items[1].blocks.as_slice() {
+                    [Block::Paragraph { spans }, Block::List { items: inner, .. }] => {
+                        assert_eq!(span_text(spans), "todo");
+                        assert_eq!(inner[0].task, Some(true));
+                        assert!(matches!(
+                            inner[0].blocks.as_slice(),
+                            [Block::Paragraph { spans }] if span_text(spans) == "nested"
+                        ));
+                    }
+                    other => panic!("expected paragraph then list, got {other:?}"),
+                }
+            }
+            other => panic!("expected one list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loose_task_list_items_keep_their_state() {
+        let blocks = parse("- [ ] a\n\n- [x] b\n");
+        match blocks.as_slice() {
+            [Block::List { items, .. }] => {
+                let tasks: Vec<Option<bool>> = items.iter().map(|i| i.task).collect();
+                assert_eq!(tasks, [Some(false), Some(true)]);
+            }
+            other => panic!("expected one list, got {other:?}"),
+        }
+    }
+
+    /// Endnotes appended after the body: a rule, then an ordered list.
+    fn endnotes(blocks: &[Block]) -> Vec<String> {
+        match blocks {
+            [
+                ..,
+                Block::ThematicBreak,
+                Block::List {
+                    ordered: true,
+                    start: 1,
+                    items,
+                },
+            ] => items
+                .iter()
+                .map(|i| match i.blocks.as_slice() {
+                    [Block::Paragraph { spans }] => span_text(spans),
+                    other => panic!("expected one paragraph per note, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected trailing endnotes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn footnotes_are_numbered_by_first_reference_and_moved_to_the_end() {
+        let md =
+            "[^b]: second note\n\nOne[^a] two[^B] again[^a].\n\n[^a]: first *note*\n\nAfter.\n";
+        let blocks = parse(md);
+        match blocks.as_slice() {
+            [
+                Block::Paragraph { spans },
+                Block::Paragraph { spans: after },
+                ..,
+            ] => {
+                assert_eq!(span_text(spans), "One1 two2 again1.");
+                let marks: Vec<&str> = spans
+                    .iter()
+                    .filter(|s| s.superscript)
+                    .map(|s| s.text.as_str())
+                    .collect();
+                assert_eq!(marks, ["1", "2", "1"]);
+                assert_eq!(span_text(after), "After.");
+            }
+            other => panic!("expected two paragraphs first, got {other:?}"),
+        }
+        assert_eq!(endnotes(&blocks), ["first note", "second note"]);
+    }
+
+    #[test]
+    fn unreferenced_footnote_definitions_are_kept_after_referenced_ones() {
+        let blocks = parse("[^z]: orphan\n\nText[^a].\n\n[^a]: used\n");
+        assert_eq!(endnotes(&blocks), ["used", "orphan"]);
+    }
+
+    #[test]
+    fn undefined_footnote_reference_stays_literal_and_adds_no_notes() {
+        let blocks = parse("See [^missing].");
+        match blocks.as_slice() {
+            [Block::Paragraph { spans }] => assert_eq!(span_text(spans), "See [^missing]."),
+            other => panic!("expected one paragraph, got {other:?}"),
         }
     }
 
@@ -240,7 +428,7 @@ mod tests {
         let blocks = parse("- outer\n  - inner\n");
         match blocks.as_slice() {
             [Block::List { items, .. }] => match items.as_slice() {
-                [item] => match item.as_slice() {
+                [item] => match item.blocks.as_slice() {
                     [Block::Paragraph { spans }, Block::List { items: inner, .. }] => {
                         assert_eq!(span_text(spans), "outer");
                         assert_eq!(inner.len(), 1);
@@ -258,7 +446,7 @@ mod tests {
         let blocks = parse("- first\n\n  second\n\n- third\n");
         match blocks.as_slice() {
             [Block::List { items, .. }] => {
-                let shapes: Vec<usize> = items.iter().map(Vec::len).collect();
+                let shapes: Vec<usize> = items.iter().map(|i| i.blocks.len()).collect();
                 assert_eq!(shapes, vec![2, 1]);
             }
             other => panic!("expected one list, got {other:?}"),
@@ -270,7 +458,7 @@ mod tests {
         let blocks = parse("- plain **bold** [link](u)\n");
         match blocks.as_slice() {
             [Block::List { items, .. }] => match items.as_slice() {
-                [item] => match item.as_slice() {
+                [item] => match item.blocks.as_slice() {
                     [Block::Paragraph { spans }] => {
                         assert_eq!(span_text(spans), "plain bold link");
                         assert!(spans.iter().any(|s| s.bold && s.text == "bold"));
@@ -303,16 +491,109 @@ mod tests {
     fn image_alt_includes_inline_code_text() {
         let blocks = parse("![a `b` c](x.png)");
         match blocks.as_slice() {
-            [Block::Paragraph { spans }] => assert_eq!(span_text(spans), "[image: a b c]"),
+            [Block::Image(image)] => assert_eq!(image.alt, "a b c"),
             other => panic!("expected one paragraph, got {other:?}"),
         }
     }
 
     #[test]
-    fn html_block_is_dropped() {
-        let blocks = parse("<div>\nhidden\n</div>\n\nafter");
+    fn blocks_before_an_html_block_are_kept() {
+        let blocks = parse("# Title\n\n<div>\nshown\n</div>\n\nafter");
         match blocks.as_slice() {
-            [Block::Paragraph { spans }] => assert_eq!(span_text(spans), "after"),
+            [
+                Block::Heading { spans: title, .. },
+                Block::CodeBlock { text },
+                Block::Paragraph { spans },
+            ] => {
+                assert_eq!(span_text(title), "Title");
+                assert_eq!(text, "<div>\nshown\n</div>\n");
+                assert_eq!(span_text(spans), "after");
+            }
+            other => panic!("expected heading, html, paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn html_comment_block_is_dropped() {
+        let blocks = parse("before\n\n<!-- hidden -->\n\nafter");
+        let texts: Vec<String> = blocks
+            .iter()
+            .map(|b| match b {
+                Block::Paragraph { spans } => span_text(spans),
+                other => panic!("expected paragraphs only, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(texts, ["before", "after"]);
+    }
+
+    #[test]
+    fn html_block_mixing_comments_and_content_is_kept() {
+        let blocks = parse("<!-- a --> <div>secret</div> <!-- b -->\n");
+        match blocks.as_slice() {
+            [Block::CodeBlock { text }] => assert!(text.contains("secret"), "{text}"),
+            other => panic!("expected the html shown verbatim, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_footnote_definitions_do_not_shift_numbers() {
+        let blocks = parse("a[^n] b[^m]\n\n[^n]: one\n\n[^n]: dup\n\n[^m]: two\n");
+        assert_eq!(endnotes(&blocks), ["one", "two", "dup"]);
+    }
+
+    #[test]
+    fn ordered_task_items_keep_their_number_and_state() {
+        let blocks = parse("1. [x] done\n2. [ ] todo\n");
+        match blocks.as_slice() {
+            [
+                Block::List {
+                    ordered: true,
+                    items,
+                    ..
+                },
+            ] => {
+                let texts: Vec<String> = items
+                    .iter()
+                    .map(|i| {
+                        assert_eq!(i.task, None);
+                        match i.blocks.as_slice() {
+                            [Block::Paragraph { spans }] => span_text(spans),
+                            other => panic!("expected one paragraph, got {other:?}"),
+                        }
+                    })
+                    .collect();
+                assert_eq!(texts, ["[x] done", "[ ] todo"]);
+            }
+            other => panic!("expected one ordered list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn linked_image_keeps_its_link() {
+        let blocks = parse("[![a](x.png)](http://l)");
+        match blocks.as_slice() {
+            [Block::Image(image)] => {
+                assert_eq!(image.src, "x.png");
+                assert_eq!(image.link.as_deref(), Some("http://l"));
+            }
+            other => panic!("expected one image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_br_tag_becomes_a_line_break() {
+        let blocks = parse("one<br>two<br />three");
+        match blocks.as_slice() {
+            [Block::Paragraph { spans }] => assert_eq!(span_text(spans), "one\ntwo\nthree"),
+            other => panic!("expected one paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_html_comment_is_dropped() {
+        let blocks = parse("a <!-- note --> b");
+        match blocks.as_slice() {
+            [Block::Paragraph { spans }] => assert_eq!(span_text(spans), "a  b"),
             other => panic!("expected one paragraph, got {other:?}"),
         }
     }
@@ -327,10 +608,35 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_extensions_fall_through_as_text() {
-        let blocks = parse("~~gone~~");
+    fn strikethrough_sets_strike_and_composes_with_other_styles() {
+        let blocks = parse("a ~~**b** [c](u)~~ d");
         match blocks.as_slice() {
-            [Block::Paragraph { spans }] => assert_eq!(span_text(spans), "~~gone~~"),
+            [Block::Paragraph { spans }] => {
+                assert_eq!(span_text(spans), "a b c d");
+                let struck: Vec<&str> = spans
+                    .iter()
+                    .filter(|s| s.strike)
+                    .map(|s| s.text.as_str())
+                    .collect();
+                assert_eq!(struck, ["b", " ", "c"]);
+                assert!(spans.iter().any(|s| s.strike && s.bold && s.text == "b"));
+                assert!(
+                    spans
+                        .iter()
+                        .any(|s| s.strike && s.link.as_deref() == Some("u"))
+                );
+            }
+            other => panic!("expected one paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn math_and_currency_dollars_stay_literal() {
+        let blocks = parse("Costs $5 and $10; $E = mc^2$");
+        match blocks.as_slice() {
+            [Block::Paragraph { spans }] => {
+                assert_eq!(span_text(spans), "Costs $5 and $10; $E = mc^2$");
+            }
             other => panic!("expected one paragraph, got {other:?}"),
         }
     }

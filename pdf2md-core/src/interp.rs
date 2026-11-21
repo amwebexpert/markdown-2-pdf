@@ -18,6 +18,11 @@ const MAX_FORM_DEPTH: usize = 8;
 const MAX_BULLET_SIZE: f32 = 8.0;
 /// Bullet diameter as a fraction of the surrounding font size.
 const BULLET_TO_FONT: f32 = 0.45;
+/// Synthetic glyphs for vector task checkboxes (see `Interpreter::bullet`).
+pub const TASK_UNCHECKED: &str = "☐";
+pub const TASK_CHECKED: &str = "☑";
+/// How far a check mark may stick out of its box, in pt.
+const CHECK_SLACK: f32 = 1.5;
 /// Height of a bullet's centre above the baseline, in font sizes.
 const BULLET_RAISE: f32 = 0.27;
 /// Shortest painted line (pt) kept as a ruling.
@@ -169,6 +174,11 @@ struct Subpath {
     points: Vec<[f32; 2]>,
     closed: bool,
     curved: bool,
+}
+
+/// Painting operators that close the current subpath first.
+fn close_op(operator: &str) -> bool {
+    matches!(operator, "s" | "b" | "b*")
 }
 
 /// Axis-aligned ruling between two points, if the segment is one.
@@ -381,11 +391,15 @@ impl<'a> Interpreter<'a> {
                 let stroked = matches!(operator, "S" | "s" | "B" | "B*" | "b" | "b*");
                 let filled = !matches!(operator, "S" | "s");
                 if let Some(bbox) = bounds(&all) {
-                    self.bullet(bbox, filled);
+                    let outline = match subpaths.as_slice() {
+                        [single] if !single.curved => Some(single.closed || close_op(operator)),
+                        _ => None,
+                    };
+                    self.bullet(bbox, filled, outline);
                 }
                 if stroked && state.stroke_gray < NEAR_WHITE {
                     let width = state.line_width * f32::midpoint(ctm.x_scale(), ctm.y_scale());
-                    let close = matches!(operator, "s" | "b" | "b*");
+                    let close = close_op(operator);
                     if width <= MAX_STROKE_WIDTH {
                         for subpath in subpaths.iter().filter(|s| !s.curved) {
                             self.stroke_rulings(subpath, close);
@@ -491,15 +505,39 @@ impl<'a> Interpreter<'a> {
     }
 
     /// Emits a synthetic bullet glyph for a small, roughly square painted shape.
-    fn bullet(&mut self, [x0, y0, x1, y1]: [f32; 4], filled: bool) {
+    ///
+    /// `outline` is `Some(closed)` for a single straight-edged subpath. A
+    /// stroked closed one is a task checkbox (`☐`); a stroked open polyline
+    /// inside the previous box is its check mark and turns it into `☑`.
+    fn bullet(&mut self, [x0, y0, x1, y1]: [f32; 4], filled: bool, outline: Option<bool>) {
+        if !filled
+            && outline == Some(false)
+            && let Some(task_box) = self.content.glyphs.last_mut()
+            && task_box.synthetic
+            && task_box.text == TASK_UNCHECKED
+            && x0 >= task_box.x - CHECK_SLACK
+            && x1 <= task_box.x + task_box.width + CHECK_SLACK
+        {
+            let middle = task_box.y + BULLET_RAISE * task_box.size;
+            let half = task_box.width / 2.0;
+            if y0 >= middle - half - CHECK_SLACK && y1 <= middle + half + CHECK_SLACK {
+                task_box.text = TASK_CHECKED.to_string();
+                return;
+            }
+        }
         let (w, h) = (x1 - x0, y1 - y0);
         let square = w > 0.5 && h > 0.5 && w <= MAX_BULLET_SIZE && h <= MAX_BULLET_SIZE;
         if !square || w > 2.0 * h || h > 2.0 * w {
             return;
         }
         let size = w.max(h) / BULLET_TO_FONT;
+        let text = match (filled, outline) {
+            (true, _) => "•",
+            (false, Some(true)) => TASK_UNCHECKED,
+            (false, _) => "◦",
+        };
         self.content.glyphs.push(Glyph {
-            text: if filled { "•" } else { "◦" }.to_string(),
+            text: text.to_string(),
             x: x0,
             y: f32::midpoint(y0, y1) - BULLET_RAISE * size,
             width: w,
@@ -664,6 +702,50 @@ mod tests {
         let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
         doc.trailer.set("Root", catalog);
         Interpreter::new(&doc).run_page(page).unwrap()
+    }
+
+    fn synthetic_texts(content: &PageContent) -> Vec<&str> {
+        content
+            .glyphs
+            .iter()
+            .filter(|g| g.synthetic)
+            .map(|g| g.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn small_painted_shapes_become_bullets() {
+        let filled = run("0 g 72 700 4 4 re f", dictionary! {});
+        assert_eq!(synthetic_texts(&filled), ["•"]);
+        let ring = run(
+            "72 700 m 72 704 76 704 76 700 c 76 696 72 696 72 700 c S",
+            dictionary! {},
+        );
+        assert_eq!(synthetic_texts(&ring), ["◦"]);
+    }
+
+    #[test]
+    fn stroked_small_square_is_an_unchecked_task_box() {
+        let content = run("0 G 0.7 w 72 700 7.7 7.7 re S", dictionary! {});
+        assert_eq!(synthetic_texts(&content), ["☐"]);
+    }
+
+    #[test]
+    fn check_mark_inside_a_task_box_checks_it() {
+        let content = run(
+            "0 G 0.7 w 72 700 7.7 7.7 re S 1.1 w 73.5 703.8 m 75.2 701.7 l 78.3 706.2 l S",
+            dictionary! {},
+        );
+        assert_eq!(synthetic_texts(&content), ["☑"]);
+    }
+
+    #[test]
+    fn check_mark_outside_any_box_is_not_a_check() {
+        let content = run(
+            "0 G 0.7 w 72 700 7.7 7.7 re S 1.1 w 173.5 703.8 m 175.2 701.7 l 178.3 706.2 l S",
+            dictionary! {},
+        );
+        assert_eq!(synthetic_texts(&content), ["☐", "◦"]);
     }
 
     #[test]

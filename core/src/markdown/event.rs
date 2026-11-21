@@ -4,6 +4,7 @@ use pulldown_cmark::{Event, Tag, TagEnd};
 
 use super::close::close_tag;
 use super::frame::Frame;
+use super::html::push_inline_html;
 use super::open::open_tag;
 use super::stack::{flush_dangling_paragraph, push_block, push_code, push_text};
 use crate::ir::Block;
@@ -11,8 +12,20 @@ use crate::ir::Block;
 fn is_inline_open(tag: &Tag<'_>) -> bool {
     matches!(
         tag,
-        Tag::Emphasis | Tag::Strong | Tag::Link { .. } | Tag::Image { .. }
+        Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Link { .. } | Tag::Image { .. }
     )
+}
+
+/// The marker belongs to the innermost open list's current item (in a loose
+/// item it arrives inside the item's Paragraph, so search down the stack).
+fn set_task(stack: &mut [Frame], checked: bool) {
+    if let Some(Frame::List { pending_task, .. }) = stack
+        .iter_mut()
+        .rev()
+        .find(|f| matches!(f, Frame::List { .. }))
+    {
+        *pending_task = Some(checked);
+    }
 }
 
 pub(super) fn apply_event(stack: &mut Vec<Frame>, event: Event<'_>) {
@@ -41,11 +54,13 @@ pub(super) fn apply_event(stack: &mut Vec<Frame>, event: Event<'_>) {
             }
             close_tag(stack, tag_end);
         }
-        Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => push_text(stack, &text),
+        Event::Text(text) | Event::Html(text) => push_text(stack, &text),
+        Event::InlineHtml(html) => push_inline_html(stack, &html),
         Event::Code(text) => push_code(stack, &text),
         Event::SoftBreak => push_text(stack, " "),
         Event::HardBreak => push_text(stack, "\n"),
         Event::Rule => push_block(stack, Block::ThematicBreak),
+        Event::TaskListMarker(checked) => set_task(stack, checked),
         _ => {}
     }
 }

@@ -2,11 +2,12 @@
 
 use pulldown_cmark::{HeadingLevel, TagEnd};
 
-use crate::ir::{Block, Span};
+use crate::ir::{Block, Image, ListItem, Span};
 
 use super::align::heading_level;
 use super::frame::Frame;
-use super::stack::{extend_spans, push_block, push_span};
+use super::html::is_html_comment;
+use super::stack::{extend_spans, push_block, push_paragraph, push_span};
 
 pub(super) fn close_tag(stack: &mut Vec<Frame>, tag_end: TagEnd) {
     match tag_end {
@@ -21,6 +22,7 @@ pub(super) fn close_tag(stack: &mut Vec<Frame>, tag_end: TagEnd) {
         TagEnd::TableCell => close_table_cell(stack),
         TagEnd::Emphasis => close_emphasis(stack),
         TagEnd::Strong => close_strong(stack),
+        TagEnd::Strikethrough => close_strikethrough(stack),
         TagEnd::Link => close_link(stack),
         TagEnd::Image => close_image(stack),
         TagEnd::HtmlBlock => close_html_block(stack),
@@ -30,7 +32,7 @@ pub(super) fn close_tag(stack: &mut Vec<Frame>, tag_end: TagEnd) {
 
 fn close_paragraph(stack: &mut Vec<Frame>) {
     if let Some(Frame::Paragraph(spans)) = stack.pop() {
-        push_block(stack, Block::Paragraph { spans });
+        push_paragraph(stack, spans);
     }
 }
 
@@ -63,6 +65,7 @@ fn close_list(stack: &mut Vec<Frame>) {
         ordered,
         start,
         items,
+        ..
     }) = stack.pop()
     {
         push_block(
@@ -78,9 +81,25 @@ fn close_list(stack: &mut Vec<Frame>) {
 
 fn close_item(stack: &mut Vec<Frame>) {
     if let Some(Frame::Container(blocks)) = stack.pop()
-        && let Some(Frame::List { items, .. }) = stack.last_mut()
+        && let Some(Frame::List {
+            ordered,
+            items,
+            pending_task,
+            ..
+        }) = stack.last_mut()
     {
-        items.push(blocks);
+        let mut blocks = blocks;
+        let mut task = pending_task.take();
+        // The checkbox takes the marker slot, so an ordered item would lose its
+        // number: keep the number and show the state as `[x] ` text instead.
+        if *ordered
+            && let Some(checked) = task.take()
+            && let Some(Block::Paragraph { spans }) = blocks.first_mut()
+        {
+            let mark = if checked { "[x] " } else { "[ ] " };
+            spans.insert(0, Span::plain(mark));
+        }
+        items.push(ListItem { task, blocks });
     }
 }
 
@@ -136,6 +155,12 @@ fn close_strong(stack: &mut Vec<Frame>) {
     }
 }
 
+fn close_strikethrough(stack: &mut Vec<Frame>) {
+    if let Some(Frame::Strikethrough(spans)) = stack.pop() {
+        extend_spans(stack, spans, |s| s.strike = true);
+    }
+}
+
 fn close_link(stack: &mut Vec<Frame>) {
     if let Some(Frame::Link { url, spans }) = stack.pop() {
         extend_spans(stack, spans, |s| s.link = Some(url.clone()));
@@ -143,11 +168,26 @@ fn close_link(stack: &mut Vec<Frame>) {
 }
 
 fn close_image(stack: &mut Vec<Frame>) {
-    if let Some(Frame::Image { alt }) = stack.pop() {
-        push_span(stack, Span::plain(format!("[image: {alt}]")));
+    if let Some(Frame::Image { src, title, alt }) = stack.pop() {
+        push_span(
+            stack,
+            Span::image_fallback(Image {
+                src,
+                alt,
+                title,
+                link: None,
+            }),
+        );
     }
 }
 
+/// Raw HTML is never interpreted: the source is shown verbatim in the code
+/// block style, except a block that is only an HTML comment, which the author
+/// meant to be hidden.
 fn close_html_block(stack: &mut Vec<Frame>) {
-    stack.pop();
+    if let Some(Frame::HtmlBlock(text)) = stack.pop()
+        && !is_html_comment(&text)
+    {
+        push_block(stack, Block::CodeBlock { text });
+    }
 }

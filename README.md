@@ -43,7 +43,8 @@ The [WebToolBox](https://amwebexpert.github.io/etoolbox/#/markdown-composer) web
   in-memory assets (PNG via `png`). No I/O.
 - [`cli/`](cli/) — `md2pdf` binary (`clap`), reads a `.md` file, writes a `.pdf` file;
   plus the `pdf2md` binary for the reverse direction.
-- [`wasm/`](wasm/) — `wasm-bindgen` wrapper exposing `markdownToPdf(markdown)`
+- [`wasm/`](wasm/) — `wasm-bindgen` wrapper exposing `markdownToPdf(markdown)`,
+  `markdownToPdfWithImages(markdown, images)`, `markdownImageSources(markdown)`
   and `pdfToMarkdown(pdf)` (in-memory, any JS context) and `convert(path)` to JS. This is the only
   crate that touches OPFS; `convert` must run inside a Web Worker (OPFS's
   synchronous access handle is worker-only).
@@ -89,11 +90,17 @@ From the repo root, run `just` to list recipes. Common entry points:
 
 - Build: `just build-cli` (or `just build-cli-release`).
 - Convert: `just convert cli/examples/kitchen-sink.md` — output defaults to the input path with a `.pdf` extension; pass `-o /path/out.pdf` after the input path when needed.
+- Images: `![alt](path "title")` standing alone in a paragraph is embedded
+  (PNG, JPEG). Relative paths resolve against the Markdown file's folder;
+  absolute paths are used as is; URLs (`http:`, `https:`, `data:`, …) are never
+  fetched. A missing or unsupported image renders as `[image: alt]` and is
+  reported on stderr as a warning; the conversion still succeeds.
 - Regenerate all sample PDFs: `just examples`.
 
-See [`cli/examples/`](cli/examples/) for inputs (`simple.md`, `kitchen-sink.md` — every
-supported construct, `nested-and-long.md` — nested lists and multi-page
-pagination). Example PDFs are not committed; see [`.gitignore`](.gitignore).
+See [`cli/examples/`](cli/examples/) for inputs (`simple.md`, `kitchen-sink.md` — core
+constructs, `features.md` — strikethrough, task lists, images, footnotes and raw
+HTML, `nested-and-long.md` — nested lists and multi-page pagination). Example
+PDFs are not committed; see [`.gitignore`](.gitignore).
 
 ## PDF → Markdown (pdf2md)
 
@@ -120,6 +127,7 @@ column by column, then rebuilds Markdown blocks:
 | Headings `#`–`######` | Font sizes above the body size (the most common size), largest first. Bold-only lines are not promoted. |
 | Paragraphs | Vertical gaps and short closing lines; wrapped lines and end-of-line hyphenation are rejoined. |
 | `-` / `1.` lists, nested | Bullet glyphs, vector-drawn bullets (browsers) and `N.` / `N)` markers; nesting from the marker indent. |
+| `- [ ]` / `- [x]` task lists | A small stroked square in the marker slot; an open stroke inside it marks the item checked (md2pdf's vector checkboxes). |
 | `**bold**`, `*italic*`, `` `code` `` | Font names, font descriptor flags, and equal glyph widths for monospace faces. |
 | `[text](url)` | URI link annotations over the text. |
 | Fenced code blocks | Runs of monospace lines; indentation recovered from glyph positions. |
@@ -152,7 +160,7 @@ and a `.d.ts`. The demo imports this directly.
 **Note:** `printpdf` (a dependency of `core`) bundles its own `wasm-bindgen`
 API unconditionally for any wasm32 build (`Pdf_HtmlToDocumentSync` and
 friends). These extra exports show up in `md2pdf_wasm.d.ts` alongside our own
-`init`/`markdownToPdf`/`pdfToMarkdown`/`convert` — harmless, but not part of this project's API; ignore them.
+`init`/`markdownToPdf`/`markdownToPdfWithImages`/`markdownImageSources`/`pdfToMarkdown`/`convert` — harmless, but not part of this project's API; ignore them.
 They also add to the ~7.5MB binary size (which includes the `pdf2md-core` PDF parser), on top of the embedded Liberation
 fonts (~2.7MB raw, unsubsetted — see [`core/src/fonts.rs`](core/src/fonts.rs)).
 
@@ -235,13 +243,25 @@ Production static output: `just demo-build`.
 
 ## Known limitations (v1)
 
-- Markdown support: headings, paragraphs, bold/italic, ordered/unordered
-  lists (incl. nested), code blocks (no syntax highlighting), links
-  (rendered as text + a real clickable PDF annotation), GFM tables
-  (content-sized columns, alignment), blockquotes (indented), and thematic
-  breaks (horizontal rules). Anything else CommonMark/GFM can emit (images,
-  strikethrough, task lists, …) falls back to plain text rather than failing
-  the conversion.
+- Markdown support (full matrix in
+  [`docs/specs/p1-c-md2pdf-features.md`](docs/specs/p1-c-md2pdf-features.md)):
+
+  | Construct | Rendering |
+  | --------- | --------- |
+  | Headings, paragraphs, bold/italic, inline code, hard breaks | Supported; styles combine inside a word (`**un**_believ_`). |
+  | Lists (ordered, unordered, nested) | Supported. |
+  | Task lists `- [ ]` / `- [x]` | Vector checkbox in the marker slot. |
+  | Strikethrough `~~x~~` | A line through the text; combines with other styles. |
+  | Links | Text + a clickable PDF annotation. |
+  | Code blocks | Monospace, no syntax highlighting. |
+  | GFM tables | Content-sized columns, alignment. |
+  | Blockquotes, thematic breaks | Indented / horizontal rule. |
+  | Images alone in a paragraph | PNG/JPEG embedded at 96 dpi, shrunk to fit the page (aspect kept), title as caption; otherwise `[image: alt]` + a warning. Images inside running text stay `[image: alt]`. |
+  | Footnotes `[^a]` | Superscript numbers; notes listed as **endnotes** after the body (not at the page bottom). |
+  | Raw HTML | Never interpreted: blocks shown verbatim in code style, inline tags kept as text, `<br>` breaks the line, comments dropped. |
+  | Math `$…$`, definition lists, super/subscript, wiki links | Not parsed: the source text is printed as written. |
+
+  Unsupported syntax never fails the conversion; it falls back to its text.
 - Unit test coverage is minimal (parser, layout helpers, entry points in
   `core/`) — run with `just test` (or `cargo test --workspace`). Beyond that,
   verify manually with `just examples` or `just demo`.

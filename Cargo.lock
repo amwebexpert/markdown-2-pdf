@@ -625,6 +625,7 @@ dependencies = [
 name = "md2pdf-core"
 version = "0.3.0"
 dependencies = [
+ "png",
  "printpdf",
  "pulldown-cmark",
  "thiserror",

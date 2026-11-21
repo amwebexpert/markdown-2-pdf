@@ -8,12 +8,15 @@
 use printpdf::{
     Actions, BorderArray, Color, FontId, HighlightingMode, Line, LinePoint, LinkAnnotation, Mm, Op,
     PaintMode, PdfDocument, PdfFontHandle, PdfPage, PdfSaveOptions, Point, Pt, Rect, Rgb, TextItem,
-    TextMatrix,
+    TextMatrix, XObjectId, XObjectTransform,
 };
+
+use std::collections::BTreeMap;
 
 use crate::error::Md2PdfError;
 use crate::fonts::{FontSet, text_width_pt};
-use crate::ir::{Align, Block, Span};
+use crate::image::{self, Decoded};
+use crate::ir::{Align, Block, Image as ImageBlock, ListItem, Span};
 
 const PAGE_WIDTH_PT: f32 = 612.0; // US Letter, 8.5in
 const PAGE_HEIGHT_PT: f32 = 792.0; // 11in
@@ -38,10 +41,42 @@ const TABLE_BORDER_THICKNESS: f32 = 0.6;
 /// an approximation (fonts don't share one ascent ratio) good enough since no
 /// pixel-perfect typography was requested.
 const BASELINE_RATIO: f32 = 0.82;
+/// Strike line height above the baseline and thickness, as fractions of the
+/// font size (roughly the x-height middle of Liberation Sans).
+const STRIKE_RISE: f32 = 0.3;
+const STRIKE_THICKNESS: f32 = 0.06;
+/// Task checkbox: side and drop below the baseline as fractions of the body
+/// font size, stroke widths in pt, and the check mark's polyline as fractions
+/// of the box side (from its bottom-left corner).
+const CHECKBOX_SIZE: f32 = 0.7;
+const CHECKBOX_DROP: f32 = 0.05;
+const CHECKBOX_STROKE: f32 = 0.7;
+const CHECK_MARK_STROKE: f32 = 1.1;
+const CHECK_MARK: [(f32, f32); 3] = [(0.2, 0.5), (0.42, 0.22), (0.82, 0.8)];
+/// Superscript (footnote marks): font size scale and baseline rise, as
+/// fractions of the surrounding text size.
+const SUPERSCRIPT_SCALE: f32 = 0.7;
+const SUPERSCRIPT_RISE: f32 = 0.35;
+/// Images are laid out at 96 dpi (1 px = 0.75 pt), the CSS reference pixel.
+const PT_PER_PX: f32 = 0.75;
+const CAPTION_SIZE: f32 = 9.0;
+const CAPTION_LEADING: f32 = 12.0;
+const CAPTION_GAP: f32 = 2.0;
 const LINK_COLOR: (f32, f32, f32) = (0.06, 0.32, 0.78);
 const BLACK: (f32, f32, f32) = (0.0, 0.0, 0.0);
 const RULE_GREY: (f32, f32, f32) = (0.7, 0.7, 0.7);
 const BORDER_GREY: (f32, f32, f32) = (0.6, 0.6, 0.6);
+
+fn horizontal_line(x_from: f32, x_to: f32, y: f32) -> Line {
+    let point = |x: f32| LinePoint {
+        p: Point { x: Pt(x), y: Pt(y) },
+        bezier: false,
+    };
+    Line {
+        points: vec![point(x_from), point(x_to)],
+        is_closed: false,
+    }
+}
 
 fn rgb((r, g, b): (f32, f32, f32)) -> Color {
     Color::Rgb(Rgb {
@@ -50,6 +85,12 @@ fn rgb((r, g, b): (f32, f32, f32)) -> Color {
         b,
         icc_profile: None,
     })
+}
+
+/// What sits in a list item's marker slot.
+enum Marker {
+    Text(String),
+    Task(bool),
 }
 
 /// Font selection, size and fill color for a single run of text.
@@ -74,14 +115,74 @@ impl TextStyle {
     }
 }
 
+/// A run of one style inside a word.
 #[derive(Clone)]
-struct Word {
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent inline styles that combine freely, as in Markdown"
+)]
+struct Fragment {
     text: String,
     bold: bool,
     italic: bool,
     code: bool,
+    strike: bool,
+    superscript: bool,
     link: Option<String>,
     width: f32,
+}
+
+impl Fragment {
+    fn new(text: String, span: &Span, bold: bool, fonts: &FontSet, size: f32) -> Self {
+        let size = if span.superscript {
+            size * SUPERSCRIPT_SCALE
+        } else {
+            size
+        };
+        let width = text_width_pt(fonts.resolve(bold, span.italic, span.code), &text, size);
+        Fragment {
+            text,
+            bold,
+            italic: span.italic,
+            code: span.code,
+            strike: span.strike,
+            superscript: span.superscript,
+            link: span.link.clone(),
+            width,
+        }
+    }
+
+    /// Font size and baseline rise of this fragment on a line of `size`.
+    fn metrics(&self, size: f32) -> (f32, f32) {
+        if self.superscript {
+            (size * SUPERSCRIPT_SCALE, size * SUPERSCRIPT_RISE)
+        } else {
+            (size, 0.0)
+        }
+    }
+}
+
+/// Text between two whitespace boundaries. Style changes without whitespace
+/// (`foo**bar**`) stay in one word as several fragments.
+#[derive(Clone, Default)]
+struct Word {
+    fragments: Vec<Fragment>,
+    width: f32,
+}
+
+impl Word {
+    fn push(&mut self, fragment: Fragment) {
+        self.width += fragment.width;
+        self.fragments.push(fragment);
+    }
+
+    fn starts_struck(&self) -> bool {
+        self.fragments.first().is_some_and(|f| f.strike)
+    }
+
+    fn ends_struck(&self) -> bool {
+        self.fragments.last().is_some_and(|f| f.strike)
+    }
 }
 
 enum Token {
@@ -89,28 +190,33 @@ enum Token {
     Break,
 }
 
+fn finish_word(tokens: &mut Vec<Token>, word: &mut Word) {
+    if !word.fragments.is_empty() {
+        tokens.push(Token::Word(std::mem::take(word)));
+    }
+}
+
 fn tokenize(spans: &[Span], fonts: &FontSet, size: f32, force_bold: bool) -> Vec<Token> {
     let mut tokens = Vec::new();
+    let mut word = Word::default();
     for span in spans {
         let bold = force_bold || span.bold;
-        let font = fonts.resolve(bold, span.italic, span.code);
         for (i, segment) in span.text.split('\n').enumerate() {
             if i > 0 {
+                finish_word(&mut tokens, &mut word);
                 tokens.push(Token::Break);
             }
-            for word in segment.split_whitespace() {
-                let width = text_width_pt(font, word, size);
-                tokens.push(Token::Word(Word {
-                    text: word.to_string(),
-                    bold,
-                    italic: span.italic,
-                    code: span.code,
-                    link: span.link.clone(),
-                    width,
-                }));
+            for (j, piece) in segment.split(char::is_whitespace).enumerate() {
+                if j > 0 {
+                    finish_word(&mut tokens, &mut word);
+                }
+                if !piece.is_empty() {
+                    word.push(Fragment::new(piece.to_string(), span, bold, fonts, size));
+                }
             }
         }
     }
+    finish_word(&mut tokens, &mut word);
     tokens
 }
 
@@ -188,6 +294,48 @@ fn wrap_monospace(fonts: &FontSet, line: &str, size: f32, max_width: f32) -> Vec
     hard_wrap_chars(font, line, size, max_width)
 }
 
+/// Hard character-wraps one word, keeping each character's fragment style.
+fn hard_wrap_word(word: Word, fonts: &FontSet, size: f32, max_width: f32) -> Vec<Word> {
+    let mut out = Vec::new();
+    let mut current = Word::default();
+    for fragment in word.fragments {
+        let font = fonts.resolve(fragment.bold, fragment.italic, fragment.code);
+        let mut piece = Fragment {
+            text: String::new(),
+            width: 0.0,
+            ..fragment.clone()
+        };
+        let (char_size, _) = fragment.metrics(size);
+        for ch in fragment.text.chars() {
+            let w = text_width_pt(font, ch.encode_utf8(&mut [0; 4]), char_size);
+            if current.width + piece.width + w > max_width
+                && (!current.fragments.is_empty() || !piece.text.is_empty())
+            {
+                if !piece.text.is_empty() {
+                    current.push(std::mem::replace(
+                        &mut piece,
+                        Fragment {
+                            text: String::new(),
+                            width: 0.0,
+                            ..fragment.clone()
+                        },
+                    ));
+                }
+                out.push(std::mem::take(&mut current));
+            }
+            piece.text.push(ch);
+            piece.width += w;
+        }
+        if !piece.text.is_empty() {
+            current.push(piece);
+        }
+    }
+    if !current.fragments.is_empty() || out.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
 /// Replaces any `Token::Word` wider than `max_width` on its own (a single
 /// unbreakable token, e.g. a path or URL with no whitespace) with several
 /// narrower `Token::Word`s hard-split at the character level, so `wrap_lines`
@@ -202,18 +350,11 @@ fn split_oversized_words(
     for token in tokens {
         match token {
             Token::Word(w) if w.width > max_width => {
-                let font = fonts.resolve(w.bold, w.italic, w.code);
-                for chunk in hard_wrap_chars(font, &w.text, size, max_width) {
-                    let width = text_width_pt(font, &chunk, size);
-                    out.push(Token::Word(Word {
-                        text: chunk,
-                        bold: w.bold,
-                        italic: w.italic,
-                        code: w.code,
-                        link: w.link.clone(),
-                        width,
-                    }));
-                }
+                out.extend(
+                    hard_wrap_word(w, fonts, size, max_width)
+                        .into_iter()
+                        .map(Token::Word),
+                );
             }
             other => out.push(other),
         }
@@ -290,7 +431,23 @@ struct FontIds {
     mono_bold_italic: FontId,
 }
 
-struct Renderer {
+/// Image bytes supplied by the caller, keyed by the URL as written in the
+/// Markdown. The renderer never reads files or fetches URLs itself.
+pub type Images = BTreeMap<String, Vec<u8>>;
+
+/// An image already added to the document: its `XObject` and natural size.
+#[derive(Clone)]
+struct Placed {
+    id: XObjectId,
+    width_px: f32,
+    height_px: f32,
+}
+
+struct Renderer<'a> {
+    images: &'a Images,
+    /// Decoded images by source; `None` when the source failed (already warned).
+    placed: BTreeMap<String, Option<Placed>>,
+    warnings: Vec<String>,
     doc: PdfDocument,
     fonts: FontSet,
     font_ids: FontIds,
@@ -300,8 +457,8 @@ struct Renderer {
     cursor_top: f32,
 }
 
-impl Renderer {
-    fn new() -> Result<Self, Md2PdfError> {
+impl<'a> Renderer<'a> {
+    fn new(images: &'a Images) -> Result<Self, Md2PdfError> {
         let fonts = FontSet::load()?;
         let mut doc = PdfDocument::new("Markdown to PDF");
         let font_ids = FontIds {
@@ -315,6 +472,9 @@ impl Renderer {
             mono_bold_italic: doc.add_font(&fonts.mono_bold_italic),
         };
         Ok(Renderer {
+            images,
+            placed: BTreeMap::new(),
+            warnings: Vec::new(),
             doc,
             fonts,
             font_ids,
@@ -397,6 +557,10 @@ impl Renderer {
             Pt(width),
             Pt(size * 1.05),
         );
+        self.add_link(rect, url);
+    }
+
+    fn add_link(&mut self, rect: Rect, url: String) {
         self.ops.push(Op::LinkAnnotation {
             link: LinkAnnotation::new(
                 rect,
@@ -408,27 +572,73 @@ impl Renderer {
         });
     }
 
+    /// Strike line in the struck text's color (`color`).
+    fn draw_strike(
+        &mut self,
+        x_from: f32,
+        x_to: f32,
+        baseline_y: f32,
+        size: f32,
+        color: (f32, f32, f32),
+    ) {
+        let y = baseline_y + size * STRIKE_RISE;
+        self.ops.push(Op::SaveGraphicsState);
+        self.ops.push(Op::SetOutlineColor { col: rgb(color) });
+        self.ops.push(Op::SetOutlineThickness {
+            pt: Pt(size * STRIKE_THICKNESS),
+        });
+        self.ops.push(Op::DrawLine {
+            line: horizontal_line(x_from, x_to, y),
+        });
+        self.ops.push(Op::RestoreGraphicsState);
+    }
+
     fn render_line(&mut self, line: &[Word], x0: f32, y: f32, size: f32) {
         let space_width = text_width_pt(&self.fonts.sans_regular, " ", size);
         let mut x = x0;
-        for word in line {
-            let color = if word.link.is_some() {
-                LINK_COLOR
-            } else {
-                BLACK
-            };
-            let style = TextStyle {
-                bold: word.bold,
-                italic: word.italic,
-                code: word.code,
-                size,
-                color,
-            };
-            self.draw_text(x, y, &word.text, style);
-            if let Some(url) = word.link.clone() {
-                self.add_link_annotation(x, y, word.width, size, url);
+        // Start x and color of the strike line being extended, if any:
+        // consecutive struck fragments of one color (and the spaces between
+        // them) share one line.
+        let mut strike: Option<(f32, (f32, f32, f32))> = None;
+        for (i, word) in line.iter().enumerate() {
+            for fragment in &word.fragments {
+                let color = if fragment.link.is_some() {
+                    LINK_COLOR
+                } else {
+                    BLACK
+                };
+                let (fragment_size, rise) = fragment.metrics(size);
+                let style = TextStyle {
+                    bold: fragment.bold,
+                    italic: fragment.italic,
+                    code: fragment.code,
+                    size: fragment_size,
+                    color,
+                };
+                self.draw_text(x, y + rise, &fragment.text, style);
+                if let Some(url) = fragment.link.clone() {
+                    self.add_link_annotation(x, y, fragment.width, size, url);
+                }
+                if let Some((from, strike_color)) = strike
+                    && (!fragment.strike || strike_color != color)
+                {
+                    self.draw_strike(from, x, y, size, strike_color);
+                    strike = None;
+                }
+                if fragment.strike && strike.is_none() {
+                    strike = Some((x, color));
+                }
+                x += fragment.width;
             }
-            x += word.width + space_width;
+            let strike_continues =
+                word.ends_struck() && line.get(i + 1).is_some_and(Word::starts_struck);
+            if let Some((from, strike_color)) = strike
+                && !strike_continues
+            {
+                self.draw_strike(from, x, y, size, strike_color);
+                strike = None;
+            }
+            x += space_width;
         }
     }
 
@@ -458,6 +668,7 @@ impl Renderer {
                 rows,
             } => self.render_table(alignments, header, rows, x0),
             Block::ThematicBreak => self.render_rule(x0, max_width),
+            Block::Image(image) => self.render_image(image, x0, max_width),
         }
     }
 
@@ -473,6 +684,19 @@ impl Renderer {
         let tokens = tokenize(spans, &self.fonts, size, force_bold);
         let tokens = split_oversized_words(tokens, &self.fonts, size, max_width);
         wrap_lines(tokens, max_width, space_width)
+    }
+
+    /// Italic `[image: alt]` paragraph standing in for an image that can't
+    /// be embedded.
+    fn render_image_fallback(&mut self, alt: &str, x0: f32, max_width: f32) {
+        let span = Span {
+            italic: true,
+            ..Span::image_fallback(ImageBlock {
+                alt: alt.to_string(),
+                ..ImageBlock::default()
+            })
+        };
+        self.render_paragraph(&[span], x0, max_width);
     }
 
     fn render_heading(&mut self, level: u8, spans: &[Span], x0: f32, max_width: f32) {
@@ -529,13 +753,64 @@ impl Renderer {
         }
     }
 
+    fn item_marker(ordered: bool, start: u64, index: usize, task: Option<bool>) -> Marker {
+        match task {
+            Some(checked) => Marker::Task(checked),
+            None => Marker::Text(Self::list_marker(ordered, start, index)),
+        }
+    }
+
+    /// Task checkbox drawn with vector strokes, so it never depends on a font
+    /// having a ballot-box glyph. Sits on the baseline like a lowercase letter.
+    fn draw_checkbox(&mut self, x: f32, baseline_y: f32, checked: bool) {
+        let side = BODY_SIZE * CHECKBOX_SIZE;
+        let bottom = baseline_y - BODY_SIZE * CHECKBOX_DROP;
+        self.ops.push(Op::SaveGraphicsState);
+        self.ops.push(Op::SetOutlineColor { col: rgb(BLACK) });
+        self.ops.push(Op::SetOutlineThickness {
+            pt: Pt(CHECKBOX_STROKE),
+        });
+        self.ops.push(Op::DrawRectangle {
+            rectangle: Rect {
+                x: Pt(x),
+                y: Pt(bottom),
+                width: Pt(side),
+                height: Pt(side),
+                mode: Some(PaintMode::Stroke),
+                winding_order: None,
+            },
+        });
+        if checked {
+            let point = |fx: f32, fy: f32| LinePoint {
+                p: Point {
+                    x: Pt(x + side * fx),
+                    y: Pt(bottom + side * fy),
+                },
+                bezier: false,
+            };
+            self.ops.push(Op::SetOutlineThickness {
+                pt: Pt(CHECK_MARK_STROKE),
+            });
+            self.ops.push(Op::DrawLine {
+                line: Line {
+                    points: CHECK_MARK.iter().map(|&(fx, fy)| point(fx, fy)).collect(),
+                    is_closed: false,
+                },
+            });
+        }
+        self.ops.push(Op::RestoreGraphicsState);
+    }
+
     fn reserve_list_line_baseline(&mut self) -> f32 {
         self.ensure_space(BODY_LEADING);
         self.next_baseline(BODY_LEADING)
     }
 
-    fn draw_list_marker(&mut self, indent: f32, y: f32, marker: &str) {
-        self.draw_text(indent, y, marker, TextStyle::regular(BODY_SIZE));
+    fn draw_list_marker(&mut self, indent: f32, y: f32, marker: &Marker) {
+        match marker {
+            Marker::Text(text) => self.draw_text(indent, y, text, TextStyle::regular(BODY_SIZE)),
+            Marker::Task(checked) => self.draw_checkbox(indent, y, *checked),
+        }
     }
 
     fn render_list_continuation_lines(
@@ -562,7 +837,7 @@ impl Renderer {
         indent: f32,
         content_x: f32,
         max_width: f32,
-        marker: &str,
+        marker: &Marker,
     ) {
         let lines =
             self.wrap_spans_to_lines(spans, max_width, BODY_SIZE, false, &self.fonts.sans_regular);
@@ -583,7 +858,7 @@ impl Renderer {
         rest: &[Block],
         indent: f32,
         content_x: f32,
-        marker: &str,
+        marker: &Marker,
     ) {
         let y = self.reserve_list_line_baseline();
         self.draw_list_marker(indent, y, marker);
@@ -591,7 +866,7 @@ impl Renderer {
         self.render_list_item_blocks(rest, content_x);
     }
 
-    fn render_list_item_marker_only(&mut self, indent: f32, marker: &str) {
+    fn render_list_item_marker_only(&mut self, indent: f32, marker: &Marker) {
         let y = self.reserve_list_line_baseline();
         self.draw_list_marker(indent, y, marker);
     }
@@ -602,7 +877,7 @@ impl Renderer {
         indent: f32,
         content_x: f32,
         max_width: f32,
-        marker: &str,
+        marker: &Marker,
     ) {
         match item_blocks.split_first() {
             Some((Block::Paragraph { spans }, rest)) => {
@@ -617,13 +892,13 @@ impl Renderer {
         }
     }
 
-    fn render_list(&mut self, ordered: bool, start: u64, items: &[Vec<Block>], indent: f32) {
+    fn render_list(&mut self, ordered: bool, start: u64, items: &[ListItem], indent: f32) {
         let content_x = indent + LIST_INDENT;
         let max_width = (PAGE_WIDTH_PT - MARGIN_PT - content_x).max(1.0);
 
-        for (i, item_blocks) in items.iter().enumerate() {
-            let marker = Self::list_marker(ordered, start, i);
-            self.render_list_item(item_blocks, indent, content_x, max_width, &marker);
+        for (i, item) in items.iter().enumerate() {
+            let marker = Self::item_marker(ordered, start, i, item.task);
+            self.render_list_item(&item.blocks, indent, content_x, max_width, &marker);
         }
     }
 
@@ -637,25 +912,7 @@ impl Renderer {
         });
         self.ops.push(Op::SetOutlineThickness { pt: Pt(1.0) });
         self.ops.push(Op::DrawLine {
-            line: Line {
-                points: vec![
-                    LinePoint {
-                        p: Point {
-                            x: Pt(x0),
-                            y: Pt(y),
-                        },
-                        bezier: false,
-                    },
-                    LinePoint {
-                        p: Point {
-                            x: Pt(x0 + max_width),
-                            y: Pt(y),
-                        },
-                        bezier: false,
-                    },
-                ],
-                is_closed: false,
-            },
+            line: horizontal_line(x0, x0 + max_width, y),
         });
         self.ops.push(Op::RestoreGraphicsState);
         self.cursor_top += BODY_LEADING * 0.5;
@@ -763,7 +1020,106 @@ impl Renderer {
         }
     }
 
-    fn finish(mut self) -> (Vec<u8>, usize) {
+    /// Decodes and embeds `src` on first use; later uses share the `XObject`.
+    /// Warns once and returns `None` when the image is missing or unusable.
+    fn place_image(&mut self, src: &str) -> Option<Placed> {
+        if let Some(placed) = self.placed.get(src) {
+            return placed.clone();
+        }
+        let decoded = match self.images.get(src) {
+            None => Err("image not found".to_string()),
+            Some(bytes) => image::decode(bytes),
+        };
+        let placed = match decoded {
+            Ok(decoded) => {
+                let (width, height) = decoded.size_px();
+                let id = match decoded {
+                    Decoded::Raw(raw) => self.doc.add_image(&raw),
+                    Decoded::Jpeg(jpeg) => self.doc.add_xobject(&jpeg),
+                };
+                Some(Placed {
+                    id,
+                    width_px: width as f32,
+                    height_px: height as f32,
+                })
+            }
+            Err(reason) => {
+                self.warnings.push(format!("image {src}: {reason}"));
+                None
+            }
+        };
+        self.placed.insert(src.to_string(), placed.clone());
+        placed
+    }
+
+    fn render_image(&mut self, image: &ImageBlock, x0: f32, max_width: f32) {
+        let Some(placed) = self.place_image(&image.src) else {
+            self.render_image_fallback(&image.alt, x0, max_width);
+            return;
+        };
+        let title = image.title.as_str();
+        let caption = if title.is_empty() {
+            Vec::new()
+        } else {
+            let span = Span {
+                italic: true,
+                ..Span::plain(title)
+            };
+            self.wrap_spans_to_lines(
+                &[span],
+                max_width,
+                CAPTION_SIZE,
+                false,
+                &self.fonts.sans_italic,
+            )
+        };
+        let caption_height = if caption.is_empty() {
+            0.0
+        } else {
+            CAPTION_GAP + caption.len() as f32 * CAPTION_LEADING
+        };
+        let printable_height = PAGE_HEIGHT_PT - 2.0 * MARGIN_PT;
+        // Never upscale; keep the caption on the image's page.
+        let scale = PT_PER_PX
+            .min(max_width / placed.width_px)
+            .min(((printable_height - caption_height) / placed.height_px).max(0.0));
+        let (width, height) = (placed.width_px * scale, placed.height_px * scale);
+        if self.cursor_top > MARGIN_PT
+            && self.cursor_top + height + caption_height > PAGE_HEIGHT_PT - MARGIN_PT
+        {
+            self.new_page();
+        }
+        self.cursor_top += height;
+        let bottom = PAGE_HEIGHT_PT - self.cursor_top;
+        self.ops.push(Op::UseXobject {
+            id: placed.id,
+            transform: XObjectTransform {
+                translate_x: Some(Pt(x0)),
+                translate_y: Some(Pt(bottom)),
+                scale_x: Some(scale),
+                scale_y: Some(scale),
+                // 1 px = 1 pt before scaling.
+                dpi: Some(72.0),
+                ..Default::default()
+            },
+        });
+        if let Some(url) = image.link.clone() {
+            self.add_link(
+                Rect::from_xywh(Pt(x0), Pt(bottom), Pt(width), Pt(height)),
+                url,
+            );
+        }
+        if !caption.is_empty() {
+            self.cursor_top += CAPTION_GAP;
+        }
+        for line in &caption {
+            let y = self.next_baseline(CAPTION_LEADING);
+            self.render_line(line, x0, y, CAPTION_SIZE);
+        }
+        self.cursor_top += PARAGRAPH_SPACING_AFTER;
+    }
+
+    fn finish(mut self) -> (Vec<u8>, usize, Vec<String>) {
         self.pages.push(PdfPage::new(
             Mm::from(Pt(PAGE_WIDTH_PT)),
             Mm::from(Pt(PAGE_HEIGHT_PT)),
@@ -773,13 +1129,17 @@ impl Renderer {
         self.doc.pages = self.pages;
         let mut warnings = Vec::new();
         let bytes = self.doc.save(&PdfSaveOptions::default(), &mut warnings);
-        (bytes, page_count)
+        (bytes, page_count, self.warnings)
     }
 }
 
-/// Returns the generated PDF bytes and the number of pages produced.
-pub fn render(blocks: &[Block]) -> Result<(Vec<u8>, usize), Md2PdfError> {
-    let mut renderer = Renderer::new()?;
+/// Returns the generated PDF bytes, the number of pages produced and the
+/// warnings about content that had to fall back (missing images, …).
+pub fn render(
+    blocks: &[Block],
+    images: &Images,
+) -> Result<(Vec<u8>, usize, Vec<String>), Md2PdfError> {
+    let mut renderer = Renderer::new(images)?;
     for block in blocks {
         renderer.render_block(block, MARGIN_PT);
     }
@@ -791,14 +1151,29 @@ mod tests {
     use super::*;
 
     fn word(text: &str, width: f32) -> Word {
-        Word {
+        let mut word = Word::default();
+        word.push(Fragment {
             text: text.to_string(),
             bold: false,
             italic: false,
             code: false,
+            strike: false,
+            superscript: false,
             link: None,
             width,
-        }
+        });
+        word
+    }
+
+    fn line_texts(lines: &[Vec<Word>]) -> Vec<Vec<String>> {
+        lines
+            .iter()
+            .map(|l| {
+                l.iter()
+                    .map(|w| w.fragments.iter().map(|f| f.text.as_str()).collect())
+                    .collect()
+            })
+            .collect()
     }
 
     #[test]
@@ -809,11 +1184,7 @@ mod tests {
             Token::Word(word("ccc", 30.0)),
         ];
         let lines = wrap_lines(tokens, 65.0, 5.0);
-        let texts: Vec<Vec<&str>> = lines
-            .iter()
-            .map(|l| l.iter().map(|w| w.text.as_str()).collect())
-            .collect();
-        assert_eq!(texts, vec![vec!["aaa", "bbb"], vec!["ccc"]]);
+        assert_eq!(line_texts(&lines), vec![vec!["aaa", "bbb"], vec!["ccc"]]);
     }
 
     #[test]
@@ -824,11 +1195,7 @@ mod tests {
             Token::Word(word("bbb", 10.0)),
         ];
         let lines = wrap_lines(tokens, 1000.0, 5.0);
-        let texts: Vec<Vec<&str>> = lines
-            .iter()
-            .map(|l| l.iter().map(|w| w.text.as_str()).collect())
-            .collect();
-        assert_eq!(texts, vec![vec!["aaa"], vec!["bbb"]]);
+        assert_eq!(line_texts(&lines), vec![vec!["aaa"], vec!["bbb"]]);
     }
 
     #[test]
@@ -873,7 +1240,8 @@ mod tests {
 
     #[test]
     fn long_unbreakable_heading_token_wraps_instead_of_overflowing() {
-        let renderer = Renderer::new().unwrap();
+        let images = Images::new();
+        let renderer = Renderer::new(&images).unwrap();
         let long_token = "src/features/Configuration/report_templates/ReportTemplateEditor.tsx";
         let max_width = 200.0;
         let lines = renderer.wrap_spans_to_lines(
@@ -890,6 +1258,376 @@ mod tests {
         }
     }
 
+    struct Rendered {
+        /// Ops of each page, the last one still open.
+        pages: Vec<Vec<Op>>,
+        warnings: Vec<String>,
+        xobjects: usize,
+    }
+
+    impl Rendered {
+        fn ops(&self) -> Vec<Op> {
+            self.pages.concat()
+        }
+    }
+
+    fn render_with(blocks: &[Block], images: &Images) -> Rendered {
+        let mut renderer = Renderer::new(images).unwrap();
+        for block in blocks {
+            renderer.render_block(block, MARGIN_PT);
+        }
+        let mut pages: Vec<Vec<Op>> = renderer.pages.iter().map(|p| p.ops.clone()).collect();
+        pages.push(renderer.ops);
+        Rendered {
+            pages,
+            warnings: renderer.warnings,
+            xobjects: renderer.doc.resources.xobjects.map.len(),
+        }
+    }
+
+    fn rendered_ops(blocks: &[Block]) -> Vec<Op> {
+        render_with(blocks, &Images::new()).ops()
+    }
+
+    /// `(text, x, y)` of every text run, in drawing order.
+    fn text_runs(ops: &[Op]) -> Vec<(String, f32, f32)> {
+        let mut at = (0.0, 0.0);
+        let mut runs = Vec::new();
+        for op in ops {
+            match op {
+                Op::SetTextMatrix {
+                    matrix: TextMatrix::Translate(x, y),
+                } => at = (x.0, y.0),
+                Op::ShowText { items } => {
+                    for item in items {
+                        if let TextItem::Text(t) = item {
+                            runs.push((t.clone(), at.0, at.1));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        runs
+    }
+
+    fn lines_drawn(ops: &[Op]) -> Vec<&Line> {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::DrawLine { line } => Some(line),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn paragraph(spans: Vec<Span>) -> Block {
+        Block::Paragraph { spans }
+    }
+
+    #[test]
+    fn adjacent_styles_inside_a_word_get_no_space() {
+        let fonts = FontSet::load().unwrap();
+        let ops = rendered_ops(&[paragraph(vec![
+            Span::plain("foo"),
+            Span {
+                text: "bar".into(),
+                bold: true,
+                ..Default::default()
+            },
+            Span::plain(" baz"),
+        ])]);
+        let runs = text_runs(&ops);
+        let texts: Vec<&str> = runs.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(texts, ["foo", "bar", "baz"]);
+        let foo_width = text_width_pt(&fonts.sans_regular, "foo", BODY_SIZE);
+        let bar_width = text_width_pt(&fonts.sans_bold, "bar", BODY_SIZE);
+        let space = text_width_pt(&fonts.sans_regular, " ", BODY_SIZE);
+        assert!((runs[1].1 - (runs[0].1 + foo_width)).abs() < 0.01);
+        assert!((runs[2].1 - (runs[1].1 + bar_width + space)).abs() < 0.01);
+    }
+
+    #[test]
+    fn strikethrough_draws_a_line_through_the_struck_text_only() {
+        let fonts = FontSet::load().unwrap();
+        let struck = |t: &str| Span {
+            text: t.into(),
+            strike: true,
+            ..Default::default()
+        };
+        let ops = rendered_ops(&[paragraph(vec![
+            Span::plain("keep "),
+            struck("gone too"),
+            Span::plain(" keep"),
+        ])]);
+        let runs = text_runs(&ops);
+        let lines = lines_drawn(&ops);
+        assert_eq!(lines.len(), 1, "one continuous strike over both words");
+        let points = &lines[0].points;
+        let (gone_x, baseline) = (runs[1].1, runs[1].2);
+        let too_end = runs[2].1 + text_width_pt(&fonts.sans_regular, "too", BODY_SIZE);
+        assert!((points[0].p.x.0 - gone_x).abs() < 0.01);
+        assert!((points[1].p.x.0 - too_end).abs() < 0.01);
+        assert!(points[0].p.y.0 > baseline && points[0].p.y.0 < baseline + BODY_SIZE * 0.5);
+    }
+
+    #[test]
+    fn plain_text_draws_no_strike_line() {
+        let ops = rendered_ops(&[paragraph(vec![Span::plain("nothing struck")])]);
+        assert!(lines_drawn(&ops).is_empty());
+    }
+
+    fn list(items: Vec<(Option<bool>, &str)>) -> Block {
+        Block::List {
+            ordered: false,
+            start: 1,
+            items: items
+                .into_iter()
+                .map(|(task, text)| ListItem {
+                    task,
+                    blocks: vec![paragraph(vec![Span::plain(text)])],
+                })
+                .collect(),
+        }
+    }
+
+    fn rectangles(ops: &[Op]) -> Vec<&Rect> {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::DrawRectangle { rectangle } => Some(rectangle),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn task_items_draw_a_vector_box_instead_of_a_bullet() {
+        let ops = rendered_ops(&[list(vec![
+            (Some(true), "done"),
+            (Some(false), "todo"),
+            (None, "plain"),
+        ])]);
+        let runs = text_runs(&ops);
+        let texts: Vec<&str> = runs.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(texts, ["done", "todo", "\u{2022}", "plain"]);
+        // Task text lines up with bulleted text.
+        assert!((runs[0].1 - runs[3].1).abs() < 0.01);
+        assert!((runs[1].1 - runs[3].1).abs() < 0.01);
+
+        let boxes = rectangles(&ops);
+        assert_eq!(boxes.len(), 2, "one box per task item");
+        for (b, run) in boxes.iter().zip(&runs) {
+            assert!(b.x.0 >= MARGIN_PT && b.x.0 + b.width.0 < run.1);
+            assert!(b.y.0 < run.2 + BODY_SIZE && b.y.0 + b.height.0 > run.2);
+        }
+        let checks = lines_drawn(&ops)
+            .into_iter()
+            .filter(|l| l.points.len() == 3)
+            .count();
+        assert_eq!(checks, 1, "only the checked item gets a check mark");
+    }
+
+    #[test]
+    fn superscript_is_smaller_raised_and_attached_to_its_word() {
+        let fonts = FontSet::load().unwrap();
+        let ops = rendered_ops(&[paragraph(vec![
+            Span::plain("One"),
+            Span {
+                text: "12".into(),
+                superscript: true,
+                ..Default::default()
+            },
+            Span::plain(" two"),
+        ])]);
+        let runs = text_runs(&ops);
+        let sizes: Vec<f32> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::SetFont { size, .. } => Some(size.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sizes, [BODY_SIZE, BODY_SIZE * SUPERSCRIPT_SCALE, BODY_SIZE]);
+        let one_width = text_width_pt(&fonts.sans_regular, "One", BODY_SIZE);
+        let mark_width = text_width_pt(&fonts.sans_regular, "12", BODY_SIZE * SUPERSCRIPT_SCALE);
+        let space = text_width_pt(&fonts.sans_regular, " ", BODY_SIZE);
+        assert!((runs[1].1 - (runs[0].1 + one_width)).abs() < 0.01);
+        assert!(runs[1].2 > runs[0].2);
+        assert!((runs[2].1 - (runs[1].1 + mark_width + space)).abs() < 0.01);
+    }
+
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, width, height);
+            encoder.set_color(png::ColorType::Grayscale);
+            let mut writer = encoder.write_header().unwrap();
+            let pixels = vec![128; (width * height) as usize];
+            writer.write_image_data(&pixels).unwrap();
+        }
+        out
+    }
+
+    fn image(src: &str, title: &str) -> Block {
+        Block::Image(ImageBlock {
+            src: src.into(),
+            alt: "the alt".into(),
+            title: title.into(),
+            link: None,
+        })
+    }
+
+    fn link_rects(ops: &[Op]) -> Vec<(Rect, String)> {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::LinkAnnotation { link } => match &link.actions {
+                    Actions::Uri(uri) => Some((link.rect.clone(), uri.clone())),
+                    Actions::Goto(_) => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn linked_image_gets_a_link_annotation_over_it() {
+        let images = Images::from([("a.png".to_string(), png_bytes(200, 100))]);
+        let block = Block::Image(ImageBlock {
+            link: Some("http://l".into()),
+            ..match image("a.png", "") {
+                Block::Image(i) => i,
+                _ => unreachable!(),
+            }
+        });
+        let ops = render_with(&[block], &images).ops();
+        let (x, y, _, _) = placements(&ops)[0];
+        let links = link_rects(&ops);
+        assert_eq!(links.len(), 1);
+        let (rect, uri) = &links[0];
+        assert_eq!(uri, "http://l");
+        assert!((rect.x.0 - x).abs() < 0.01 && (rect.y.0 - y).abs() < 0.01);
+        assert!((rect.width.0 - 150.0).abs() < 0.01 && (rect.height.0 - 75.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn full_page_image_with_caption_stays_inside_the_margins() {
+        let images = Images::from([("t.png".to_string(), png_bytes(100, 3000))]);
+        let ops = render_with(&[image("t.png", "Caption")], &images).ops();
+        let caption_baseline = text_runs(&ops)[0].2;
+        assert!(caption_baseline >= MARGIN_PT, "{caption_baseline}");
+    }
+
+    #[test]
+    fn strike_through_a_link_uses_the_link_color() {
+        let ops = rendered_ops(&[paragraph(vec![Span {
+            text: "gone".into(),
+            strike: true,
+            link: Some("u".into()),
+            ..Default::default()
+        }])]);
+        let strike_color = ops
+            .iter()
+            .find_map(|op| match op {
+                Op::SetOutlineColor { col } => Some(col.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(strike_color, rgb(LINK_COLOR));
+    }
+
+    /// `(x, y, scale_x, scale_y)` of every placed `XObject`.
+    fn placements(ops: &[Op]) -> Vec<(f32, f32, f32, f32)> {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::UseXobject { transform, .. } => Some((
+                    transform.translate_x.unwrap().0,
+                    transform.translate_y.unwrap().0,
+                    transform.scale_x.unwrap(),
+                    transform.scale_y.unwrap(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn image_is_drawn_at_96_dpi_below_the_cursor() {
+        let images = Images::from([("a.png".to_string(), png_bytes(200, 100))]);
+        let rendered = render_with(&[image("a.png", "")], &images);
+        assert!(rendered.warnings.is_empty(), "{:?}", rendered.warnings);
+        let placed = placements(&rendered.ops());
+        assert_eq!(placed.len(), 1);
+        let (x, y, sx, sy) = placed[0];
+        // 200 × 100 px at 96 dpi = 150 × 75 pt, with 1 px = 1 pt before scaling.
+        assert!((sx * 200.0 - 150.0).abs() < 0.01 && (sy * 100.0 - 75.0).abs() < 0.01);
+        assert!((x - MARGIN_PT).abs() < 0.01);
+        assert!(y < PAGE_HEIGHT_PT - MARGIN_PT - 75.0 + 0.01);
+    }
+
+    #[test]
+    fn wide_image_shrinks_to_the_content_width_keeping_aspect_ratio() {
+        let images = Images::from([("w.png".to_string(), png_bytes(2000, 500))]);
+        let ops = render_with(&[image("w.png", "")], &images).ops();
+        let (_, _, sx, sy) = placements(&ops)[0];
+        let content_width = PAGE_WIDTH_PT - 2.0 * MARGIN_PT;
+        assert!((sx * 2000.0 - content_width).abs() < 0.01);
+        assert!((sx - sy).abs() < 1e-6, "aspect ratio kept");
+    }
+
+    #[test]
+    fn tall_image_shrinks_to_the_printable_height() {
+        let images = Images::from([("t.png".to_string(), png_bytes(100, 3000))]);
+        let ops = render_with(&[image("t.png", "")], &images).ops();
+        let (_, y, _, sy) = placements(&ops)[0];
+        assert!((sy * 3000.0 - (PAGE_HEIGHT_PT - 2.0 * MARGIN_PT)).abs() < 0.01);
+        assert!((y - MARGIN_PT).abs() < 0.01);
+    }
+
+    #[test]
+    fn image_that_does_not_fit_starts_a_new_page() {
+        let images = Images::from([("a.png".to_string(), png_bytes(400, 600))]);
+        let filler: Vec<Block> = (0..30)
+            .map(|_| paragraph(vec![Span::plain("line")]))
+            .collect();
+        let mut blocks = filler;
+        blocks.push(image("a.png", ""));
+        let rendered = render_with(&blocks, &images);
+        assert_eq!(rendered.pages.len(), 2);
+        assert!(placements(&rendered.pages[0]).is_empty());
+        assert_eq!(placements(&rendered.pages[1]).len(), 1);
+    }
+
+    #[test]
+    fn title_becomes_a_caption_under_the_image() {
+        let images = Images::from([("a.png".to_string(), png_bytes(200, 100))]);
+        let ops = render_with(&[image("a.png", "Figure one")], &images).ops();
+        let (_, image_bottom, _, _) = placements(&ops)[0];
+        let runs = text_runs(&ops);
+        let texts: Vec<&str> = runs.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(texts, ["Figure", "one"]);
+        assert!(runs[0].2 < image_bottom);
+    }
+
+    #[test]
+    fn repeated_image_is_embedded_once() {
+        let images = Images::from([("a.png".to_string(), png_bytes(10, 10))]);
+        let rendered = render_with(&[image("a.png", ""), image("a.png", "")], &images);
+        assert_eq!(placements(&rendered.ops()).len(), 2);
+        assert_eq!(rendered.xobjects, 1);
+    }
+
+    #[test]
+    fn missing_or_broken_image_falls_back_to_alt_text_with_a_warning() {
+        let images = Images::from([("bad.png".to_string(), b"not an image".to_vec())]);
+        let rendered = render_with(&[image("missing.png", ""), image("bad.png", "")], &images);
+        let ops = rendered.ops();
+        assert!(placements(&ops).is_empty());
+        let texts: Vec<String> = text_runs(&ops).into_iter().map(|r| r.0).collect();
+        assert_eq!(texts, ["[image:", "the", "alt]", "[image:", "the", "alt]"]);
+        assert_eq!(rendered.warnings.len(), 2);
+        assert!(rendered.warnings[0].contains("missing.png"));
+        assert!(rendered.warnings[1].contains("bad.png"));
+    }
+
     #[test]
     fn render_produces_a_single_page_pdf() {
         let blocks = vec![
@@ -901,7 +1639,7 @@ mod tests {
                 spans: vec![Span::plain("Body text.")],
             },
         ];
-        let (bytes, page_count) = render(&blocks).unwrap();
+        let (bytes, page_count, _) = render(&blocks, &Images::new()).unwrap();
         assert_eq!(page_count, 1);
         assert!(bytes.starts_with(b"%PDF"));
     }
