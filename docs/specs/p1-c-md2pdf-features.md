@@ -1,6 +1,6 @@
 # md2pdf — P1-C spec: Markdown feature coverage
 
-Status: in progress · Source: `improvements.md` §6 · One PR (`feat/md2pdf-features`).
+Status: implemented · Source: `improvements.md` §6 · One PR (`feat/md2pdf-features`).
 
 ## Context
 
@@ -84,12 +84,16 @@ font glyph dependency. Text alignment is identical to bulleted items.
   directory; absolute paths are used as is; URLs with a scheme (`http:`,
   `https:`, `data:`, …) are never fetched (warning). Unreadable files →
   warning. Warnings go to stderr; the conversion still succeeds.
-- **WASM.** `markdownToPdf(markdown, images?)`: optional `Map<string,
-  Uint8Array>` (or plain object). Old one-argument calls keep working.
+- **WASM.** `markdownToPdf` is unchanged. New `markdownImageSources(markdown)`
+  and `markdownToPdfWithImages(markdown, images)` (a `Map<string, Uint8Array>`
+  or plain object) returning `{ pdf, pageCount, warnings }`: a separate
+  function rather than an optional argument, so warnings can be returned
+  without changing `markdownToPdf`'s return type.
 - **Decoding** (no `image` crate): PNG via the `png` crate already in the
-  workspace (palette/16-bit expanded to 8-bit gray/RGB, alpha dropped onto
-  white); JPEG passed through as a `/DCTDecode` XObject (size and components
-  read from the SOF marker). Anything else → fallback.
+  workspace (palette/16-bit expanded to 8-bit gray/RGB; alpha kept, printpdf
+  writes it as a soft mask); JPEG passed through as a `/DCTDecode` XObject
+  (size and components read from the SOF marker; CMYK JPEGs are rejected).
+  Anything else → fallback.
 - **Layout.** Natural size = px × 0.75 pt (96 dpi). Scaled down (never up)
   to fit the content width and the printable height, aspect ratio kept. If
   it doesn't fit under the cursor and the cursor isn't at the top of a page,
@@ -111,6 +115,13 @@ font glyph dependency. Text alignment is identical to bulleted items.
 `ENABLE_MATH` stays off: `$E = mc^2$` prints verbatim, so currency text is
 never misread and the source is preserved. A future renderer can turn the
 option on and map `InlineMath`/`DisplayMath` without parser changes.
+
+### pdf2md side (round trip)
+md2pdf's vector checkbox (stroked square + open check stroke) was read back
+as two hollow bullets, garbling checked items. `pdf2md-core` now turns a small
+stroked closed square into a task box, an open stroke inside it into a check,
+and emits `- [ ]` / `- [x]`. Strikethrough is not recovered (no strike
+detection in pdf2md; text kept).
 
 ## Tests
 

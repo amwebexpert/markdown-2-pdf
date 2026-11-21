@@ -32,6 +32,26 @@ link.download = "hello.pdf";
 link.click();
 ```
 
+### Markdown with images → PDF (any context)
+
+The module never reads files or fetches URLs: list the images a document
+embeds, load them however you like, and pass the bytes in. PNG and JPEG are
+embedded; anything missing becomes `[image: alt]` and a warning.
+
+```ts
+import init, { markdownImageSources, markdownToPdfWithImages } from "@amwebexpert/md2pdf-wasm";
+
+await init(); // once
+
+const images = new Map<string, Uint8Array>();
+for (const src of markdownImageSources(markdown)) {
+  const response = await fetch(new URL(src, baseUrl));
+  if (response.ok) images.set(src, new Uint8Array(await response.arrayBuffer()));
+}
+const result = markdownToPdfWithImages(markdown, images); // Map or plain object
+console.log(result.pdf, result.pageCount, result.warnings);
+```
+
 ### PDF bytes → Markdown string (any context)
 
 Works on the main thread or in a Web Worker. Extracted images are embedded as
