@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::font::FontStyle;
-use crate::interp::Glyph;
+use crate::interp::{Glyph, TASK_CHECKED, TASK_UNCHECKED};
 use crate::layout::{Item, Line, dominant_size, half_points};
 use crate::tables::{Align, Cell, Table};
 
@@ -23,6 +23,7 @@ const WORD_GAP: f32 = 0.15;
 const PARAGRAPH_GAP: f32 = 1.35;
 const BULLETS: &[char] = &[
     '•', '◦', '▪', '▫', '■', '□', '●', '○', '‣', '⁃', '–', '—', '-', '*', '·', '∙', '►', '▶', '❖',
+    '☐', '☑',
 ];
 const CLOSING_PUNCTUATION: &[char] = &[',', '.', ')'];
 const SENTENCE_END: &[char] = &['.', '!', '?', ':', ';', '"', '”', '»', ')'];
@@ -46,6 +47,8 @@ pub enum Block {
     ListItem {
         /// Ordered list number, `None` for bullets.
         number: Option<u64>,
+        /// `Some(checked)` when the marker is a task checkbox.
+        task: Option<bool>,
         /// x of the marker from the column's left edge, used to derive nesting levels.
         marker_x: f32,
         runs: Vec<Run>,
@@ -347,8 +350,14 @@ fn close(open: Option<Open>, blocks: &mut Vec<Block>) {
         }
         Kind::Item { number, marker_x } => {
             let skip = lines.first().and_then(list_marker).map_or(0, |(_, _, i)| i);
+            let task = match lines.first().and_then(|l| l.glyphs.first()) {
+                Some(g) if g.synthetic && g.text == TASK_CHECKED => Some(true),
+                Some(g) if g.synthetic && g.text == TASK_UNCHECKED => Some(false),
+                _ => None,
+            };
             Block::ListItem {
                 number,
+                task,
                 marker_x,
                 runs: join_lines(&lines, skip),
             }

@@ -76,6 +76,7 @@ fn list(items: &[Block]) -> String {
     for item in items {
         let Block::ListItem {
             number,
+            task,
             marker_x,
             runs,
         } = item
@@ -91,8 +92,13 @@ fn list(items: &[Block]) -> String {
         let indent = columns.last().copied().unwrap_or(0);
         let marker = number.map_or_else(|| "-".to_string(), |n| format!("{n}."));
         columns.push(indent + marker.len() + 1);
+        let checkbox = match task {
+            Some(true) => "[x] ",
+            Some(false) => "[ ] ",
+            None => "",
+        };
         lines.push(format!(
-            "{}{marker} {}",
+            "{}{marker} {checkbox}{}",
             " ".repeat(indent),
             inline(runs, false).trim()
         ));
@@ -380,6 +386,7 @@ mod tests {
     fn nested_lists_indent_under_their_parent_content() {
         let item = |number, marker_x, text: &str| Block::ListItem {
             number,
+            task: None,
             marker_x,
             runs: vec![run(text, false, false, false)],
         };
@@ -389,6 +396,22 @@ mod tests {
             item(Some(2), 72.0, "two"),
         ];
         assert_eq!(markdown(&blocks), "1. one\n   - child\n2. two\n");
+    }
+
+    #[test]
+    fn task_items_get_a_checkbox_after_the_marker() {
+        let item = |task, marker_x, text: &str| Block::ListItem {
+            number: None,
+            task,
+            marker_x,
+            runs: vec![run(text, false, false, false)],
+        };
+        let blocks = [
+            item(Some(true), 72.0, "done"),
+            item(Some(false), 90.0, "todo"),
+            item(None, 72.0, "plain"),
+        ];
+        assert_eq!(markdown(&blocks), "- [x] done\n  - [ ] todo\n- plain\n");
     }
 
     #[test]

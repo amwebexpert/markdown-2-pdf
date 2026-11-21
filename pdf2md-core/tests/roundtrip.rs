@@ -34,7 +34,7 @@ fn multi_page_snapshot() {
 }
 
 #[test]
-fn strikethrough_task_lists_and_footnotes_keep_their_text() {
+fn strikethrough_task_lists_and_footnotes_round_trip() {
     let markdown = round_trip(
         "This is ~~deprecated~~ text.[^source]\n\n\
          - [x] Completed item\n\
@@ -44,9 +44,7 @@ fn strikethrough_task_lists_and_footnotes_keep_their_text() {
     );
     for expected in [
         "This is deprecated text.1",
-        "Completed item",
-        "Pending item",
-        "Nested completed item",
+        "- [x] Completed item\n- [ ] Pending item\n  - [x] Nested completed item\n",
         "1. Supporting information.",
     ] {
         assert!(
@@ -54,8 +52,6 @@ fn strikethrough_task_lists_and_footnotes_keep_their_text() {
             "{expected:?} missing in:\n{markdown}"
         );
     }
-    // The checkboxes are vector boxes, not text.
-    assert!(!markdown.contains("[x]") && !markdown.contains("[ ]"));
 }
 
 #[expect(
@@ -120,4 +116,25 @@ fn embedded_jpeg_is_passed_through_byte_for_byte() {
     assert_eq!(output.assets.len(), 1);
     assert_eq!(output.assets[0].mime, "image/jpeg");
     assert_eq!(output.assets[0].bytes, jpeg);
+}
+
+#[test]
+fn features_example_snapshot() {
+    let options = md2pdf_core::Options {
+        images: [(
+            "images/diagram.png".to_string(),
+            include_bytes!("../../cli/examples/images/diagram.png").to_vec(),
+        )]
+        .into(),
+    };
+    let rendered =
+        md2pdf_core::convert_with_options(include_str!("../../cli/examples/features.md"), &options)
+            .unwrap();
+    assert_eq!(
+        rendered.warnings,
+        ["image images/missing.png: image not found"]
+    );
+    let output = convert(&rendered.pdf, &Options::default()).unwrap();
+    assert_eq!(output.assets.len(), 1);
+    insta::assert_snapshot!(output.markdown);
 }

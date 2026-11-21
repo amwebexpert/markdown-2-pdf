@@ -1,0 +1,48 @@
+---
+source: pdf2md-core/tests/roundtrip.rs
+expression: output.markdown
+---
+# Markdown features
+
+Inline styles combine freely: **bold**, *italic*, `code`, struck, **struck bold** and [a struck link](https://example.com), and styles glued inside one word like **un***believ*`able`.
+
+## Task list
+
+- [x] Completed item
+- [ ] Pending item
+  - [x] Nested completed item
+  - [ ] Nested pending item
+- A plain bullet for comparison
+
+## Image
+
+Local images are resolved relative to this file; the title becomes a caption.
+
+![](images/img-001.png)
+
+*Figure 1 — a generated diagram*
+
+A missing image falls back to its alt text and a warning:
+
+*\[image: a picture that is not there\]*
+
+## Footnotes
+
+A statement with a footnote.1 Another one,2 and the first again.1
+
+## Raw HTML
+
+A `<br>` tag breaks the line, other tags like \<kbd>this\</kbd> stay literal, and comments are dropped.
+
+```
+<div class="note">
+  Block HTML is shown verbatim, never interpreted.
+</div>
+```
+
+Prices in dollars such as $5 or $10 stay as written, and so does math source like $E = mc^2$.
+
+---
+
+1. Supporting information, shown as an endnote.
+2. Footnotes are numbered in the order they are first referenced.
