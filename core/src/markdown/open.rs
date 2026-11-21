@@ -18,6 +18,7 @@ pub(super) fn open_tag(stack: &mut Vec<Frame>, tag: Tag<'_>) {
         Tag::TableCell => open_table_cell(stack),
         Tag::Emphasis => open_emphasis(stack),
         Tag::Strong => open_strong(stack),
+        Tag::Strikethrough => open_strikethrough(stack),
         Tag::Link { dest_url, .. } => open_link(stack, dest_url.into_string()),
         Tag::Image { .. } => open_image(stack),
         Tag::HtmlBlock => open_html_block(stack),
@@ -46,6 +47,7 @@ fn open_list(stack: &mut Vec<Frame>, start: Option<u64>) {
         ordered: start.is_some(),
         start: start.unwrap_or(1),
         items: Vec::new(),
+        pending_task: None,
     });
 }
 
@@ -81,6 +83,10 @@ fn open_strong(stack: &mut Vec<Frame>) {
     stack.push(Frame::Strong(Vec::new()));
 }
 
+fn open_strikethrough(stack: &mut Vec<Frame>) {
+    stack.push(Frame::Strikethrough(Vec::new()));
+}
+
 fn open_link(stack: &mut Vec<Frame>, url: String) {
     stack.push(Frame::Link {
         url,
@@ -93,7 +99,6 @@ fn open_image(stack: &mut Vec<Frame>) {
 }
 
 fn open_html_block(stack: &mut Vec<Frame>) {
-    // HtmlBlock content arrives as Event::Html while this frame is on top;
-    // out of the requested feature scope, so it's dropped rather than rendered.
-    stack.push(Frame::Container(Vec::new()));
+    // HtmlBlock content arrives as Event::Html while this frame is on top.
+    stack.push(Frame::HtmlBlock(String::new()));
 }

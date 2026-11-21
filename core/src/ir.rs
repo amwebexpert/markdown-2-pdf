@@ -6,6 +6,7 @@ pub struct Span {
     pub bold: bool,
     pub italic: bool,
     pub code: bool,
+    pub strike: bool,
     pub link: Option<String>,
 }
 
@@ -45,7 +46,7 @@ pub enum Block {
     List {
         ordered: bool,
         start: u64,
-        items: Vec<Vec<Block>>,
+        items: Vec<ListItem>,
     },
     BlockQuote(Vec<Block>),
     Table {
@@ -54,4 +55,11 @@ pub enum Block {
         rows: Vec<Vec<Vec<Span>>>,
     },
     ThematicBreak,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListItem {
+    /// `Some(checked)` for a GFM task list item (`- [x]` / `- [ ]`).
+    pub task: Option<bool>,
+    pub blocks: Vec<Block>,
 }

@@ -13,7 +13,7 @@ use printpdf::{
 
 use crate::error::Md2PdfError;
 use crate::fonts::{FontSet, text_width_pt};
-use crate::ir::{Align, Block, Span};
+use crate::ir::{Align, Block, ListItem, Span};
 
 const PAGE_WIDTH_PT: f32 = 612.0; // US Letter, 8.5in
 const PAGE_HEIGHT_PT: f32 = 792.0; // 11in
@@ -38,10 +38,27 @@ const TABLE_BORDER_THICKNESS: f32 = 0.6;
 /// an approximation (fonts don't share one ascent ratio) good enough since no
 /// pixel-perfect typography was requested.
 const BASELINE_RATIO: f32 = 0.82;
+/// Strike line height above the baseline and thickness, as fractions of the
+/// font size (roughly the x-height middle of Liberation Sans).
+const STRIKE_RISE: f32 = 0.3;
+const STRIKE_THICKNESS: f32 = 0.06;
+/// Task checkbox side, as a fraction of the body font size.
+const CHECKBOX_SIZE: f32 = 0.7;
 const LINK_COLOR: (f32, f32, f32) = (0.06, 0.32, 0.78);
 const BLACK: (f32, f32, f32) = (0.0, 0.0, 0.0);
 const RULE_GREY: (f32, f32, f32) = (0.7, 0.7, 0.7);
 const BORDER_GREY: (f32, f32, f32) = (0.6, 0.6, 0.6);
+
+fn horizontal_line(x_from: f32, x_to: f32, y: f32) -> Line {
+    let point = |x: f32| LinePoint {
+        p: Point { x: Pt(x), y: Pt(y) },
+        bezier: false,
+    };
+    Line {
+        points: vec![point(x_from), point(x_to)],
+        is_closed: false,
+    }
+}
 
 fn rgb((r, g, b): (f32, f32, f32)) -> Color {
     Color::Rgb(Rgb {
@@ -50,6 +67,12 @@ fn rgb((r, g, b): (f32, f32, f32)) -> Color {
         b,
         icc_profile: None,
     })
+}
+
+/// What sits in a list item's marker slot.
+enum Marker {
+    Text(String),
+    Task(bool),
 }
 
 /// Font selection, size and fill color for a single run of text.
@@ -74,14 +97,54 @@ impl TextStyle {
     }
 }
 
+/// A run of one style inside a word.
 #[derive(Clone)]
-struct Word {
+struct Fragment {
     text: String,
     bold: bool,
     italic: bool,
     code: bool,
+    strike: bool,
     link: Option<String>,
     width: f32,
+}
+
+impl Fragment {
+    fn new(text: String, span: &Span, bold: bool, fonts: &FontSet, size: f32) -> Self {
+        let width = text_width_pt(fonts.resolve(bold, span.italic, span.code), &text, size);
+        Fragment {
+            text,
+            bold,
+            italic: span.italic,
+            code: span.code,
+            strike: span.strike,
+            link: span.link.clone(),
+            width,
+        }
+    }
+}
+
+/// Text between two whitespace boundaries. Style changes without whitespace
+/// (`foo**bar**`) stay in one word as several fragments.
+#[derive(Clone, Default)]
+struct Word {
+    fragments: Vec<Fragment>,
+    width: f32,
+}
+
+impl Word {
+    fn push(&mut self, fragment: Fragment) {
+        self.width += fragment.width;
+        self.fragments.push(fragment);
+    }
+
+    fn starts_struck(&self) -> bool {
+        self.fragments.first().is_some_and(|f| f.strike)
+    }
+
+    fn ends_struck(&self) -> bool {
+        self.fragments.last().is_some_and(|f| f.strike)
+    }
 }
 
 enum Token {
@@ -89,28 +152,33 @@ enum Token {
     Break,
 }
 
+fn finish_word(tokens: &mut Vec<Token>, word: &mut Word) {
+    if !word.fragments.is_empty() {
+        tokens.push(Token::Word(std::mem::take(word)));
+    }
+}
+
 fn tokenize(spans: &[Span], fonts: &FontSet, size: f32, force_bold: bool) -> Vec<Token> {
     let mut tokens = Vec::new();
+    let mut word = Word::default();
     for span in spans {
         let bold = force_bold || span.bold;
-        let font = fonts.resolve(bold, span.italic, span.code);
         for (i, segment) in span.text.split('\n').enumerate() {
             if i > 0 {
+                finish_word(&mut tokens, &mut word);
                 tokens.push(Token::Break);
             }
-            for word in segment.split_whitespace() {
-                let width = text_width_pt(font, word, size);
-                tokens.push(Token::Word(Word {
-                    text: word.to_string(),
-                    bold,
-                    italic: span.italic,
-                    code: span.code,
-                    link: span.link.clone(),
-                    width,
-                }));
+            for (j, piece) in segment.split(char::is_whitespace).enumerate() {
+                if j > 0 {
+                    finish_word(&mut tokens, &mut word);
+                }
+                if !piece.is_empty() {
+                    word.push(Fragment::new(piece.to_string(), span, bold, fonts, size));
+                }
             }
         }
     }
+    finish_word(&mut tokens, &mut word);
     tokens
 }
 
@@ -188,6 +256,47 @@ fn wrap_monospace(fonts: &FontSet, line: &str, size: f32, max_width: f32) -> Vec
     hard_wrap_chars(font, line, size, max_width)
 }
 
+/// Hard character-wraps one word, keeping each character's fragment style.
+fn hard_wrap_word(word: Word, fonts: &FontSet, size: f32, max_width: f32) -> Vec<Word> {
+    let mut out = Vec::new();
+    let mut current = Word::default();
+    for fragment in word.fragments {
+        let font = fonts.resolve(fragment.bold, fragment.italic, fragment.code);
+        let mut piece = Fragment {
+            text: String::new(),
+            width: 0.0,
+            ..fragment.clone()
+        };
+        for ch in fragment.text.chars() {
+            let w = text_width_pt(font, ch.encode_utf8(&mut [0; 4]), size);
+            if current.width + piece.width + w > max_width
+                && (!current.fragments.is_empty() || !piece.text.is_empty())
+            {
+                if !piece.text.is_empty() {
+                    current.push(std::mem::replace(
+                        &mut piece,
+                        Fragment {
+                            text: String::new(),
+                            width: 0.0,
+                            ..fragment.clone()
+                        },
+                    ));
+                }
+                out.push(std::mem::take(&mut current));
+            }
+            piece.text.push(ch);
+            piece.width += w;
+        }
+        if !piece.text.is_empty() {
+            current.push(piece);
+        }
+    }
+    if !current.fragments.is_empty() || out.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
 /// Replaces any `Token::Word` wider than `max_width` on its own (a single
 /// unbreakable token, e.g. a path or URL with no whitespace) with several
 /// narrower `Token::Word`s hard-split at the character level, so `wrap_lines`
@@ -202,18 +311,11 @@ fn split_oversized_words(
     for token in tokens {
         match token {
             Token::Word(w) if w.width > max_width => {
-                let font = fonts.resolve(w.bold, w.italic, w.code);
-                for chunk in hard_wrap_chars(font, &w.text, size, max_width) {
-                    let width = text_width_pt(font, &chunk, size);
-                    out.push(Token::Word(Word {
-                        text: chunk,
-                        bold: w.bold,
-                        italic: w.italic,
-                        code: w.code,
-                        link: w.link.clone(),
-                        width,
-                    }));
-                }
+                out.extend(
+                    hard_wrap_word(w, fonts, size, max_width)
+                        .into_iter()
+                        .map(Token::Word),
+                );
             }
             other => out.push(other),
         }
@@ -408,27 +510,62 @@ impl Renderer {
         });
     }
 
+    fn draw_strike(&mut self, x_from: f32, x_to: f32, baseline_y: f32, size: f32) {
+        let y = baseline_y + size * STRIKE_RISE;
+        self.ops.push(Op::SaveGraphicsState);
+        self.ops.push(Op::SetOutlineColor { col: rgb(BLACK) });
+        self.ops.push(Op::SetOutlineThickness {
+            pt: Pt(size * STRIKE_THICKNESS),
+        });
+        self.ops.push(Op::DrawLine {
+            line: horizontal_line(x_from, x_to, y),
+        });
+        self.ops.push(Op::RestoreGraphicsState);
+    }
+
     fn render_line(&mut self, line: &[Word], x0: f32, y: f32, size: f32) {
         let space_width = text_width_pt(&self.fonts.sans_regular, " ", size);
         let mut x = x0;
-        for word in line {
-            let color = if word.link.is_some() {
-                LINK_COLOR
-            } else {
-                BLACK
-            };
-            let style = TextStyle {
-                bold: word.bold,
-                italic: word.italic,
-                code: word.code,
-                size,
-                color,
-            };
-            self.draw_text(x, y, &word.text, style);
-            if let Some(url) = word.link.clone() {
-                self.add_link_annotation(x, y, word.width, size, url);
+        // Start x of the strike line being extended, if any: consecutive
+        // struck fragments (and the spaces between them) share one line.
+        let mut strike_from: Option<f32> = None;
+        for (i, word) in line.iter().enumerate() {
+            for fragment in &word.fragments {
+                let color = if fragment.link.is_some() {
+                    LINK_COLOR
+                } else {
+                    BLACK
+                };
+                let style = TextStyle {
+                    bold: fragment.bold,
+                    italic: fragment.italic,
+                    code: fragment.code,
+                    size,
+                    color,
+                };
+                self.draw_text(x, y, &fragment.text, style);
+                if let Some(url) = fragment.link.clone() {
+                    self.add_link_annotation(x, y, fragment.width, size, url);
+                }
+                match (fragment.strike, strike_from) {
+                    (true, None) => strike_from = Some(x),
+                    (false, Some(from)) => {
+                        self.draw_strike(from, x, y, size);
+                        strike_from = None;
+                    }
+                    _ => {}
+                }
+                x += fragment.width;
             }
-            x += word.width + space_width;
+            let strike_continues =
+                word.ends_struck() && line.get(i + 1).is_some_and(Word::starts_struck);
+            if let Some(from) = strike_from
+                && !strike_continues
+            {
+                self.draw_strike(from, x, y, size);
+                strike_from = None;
+            }
+            x += space_width;
         }
     }
 
@@ -529,13 +666,60 @@ impl Renderer {
         }
     }
 
+    fn item_marker(ordered: bool, start: u64, index: usize, task: Option<bool>) -> Marker {
+        match task {
+            Some(checked) => Marker::Task(checked),
+            None => Marker::Text(Self::list_marker(ordered, start, index)),
+        }
+    }
+
+    /// Task checkbox drawn with vector strokes, so it never depends on a font
+    /// having a ballot-box glyph. Sits on the baseline like a lowercase letter.
+    fn draw_checkbox(&mut self, x: f32, baseline_y: f32, checked: bool) {
+        let side = BODY_SIZE * CHECKBOX_SIZE;
+        let bottom = baseline_y - BODY_SIZE * 0.05;
+        self.ops.push(Op::SaveGraphicsState);
+        self.ops.push(Op::SetOutlineColor { col: rgb(BLACK) });
+        self.ops.push(Op::SetOutlineThickness { pt: Pt(0.7) });
+        self.ops.push(Op::DrawRectangle {
+            rectangle: Rect {
+                x: Pt(x),
+                y: Pt(bottom),
+                width: Pt(side),
+                height: Pt(side),
+                mode: Some(PaintMode::Stroke),
+                winding_order: None,
+            },
+        });
+        if checked {
+            let point = |fx: f32, fy: f32| LinePoint {
+                p: Point {
+                    x: Pt(x + side * fx),
+                    y: Pt(bottom + side * fy),
+                },
+                bezier: false,
+            };
+            self.ops.push(Op::SetOutlineThickness { pt: Pt(1.1) });
+            self.ops.push(Op::DrawLine {
+                line: Line {
+                    points: vec![point(0.2, 0.5), point(0.42, 0.22), point(0.82, 0.8)],
+                    is_closed: false,
+                },
+            });
+        }
+        self.ops.push(Op::RestoreGraphicsState);
+    }
+
     fn reserve_list_line_baseline(&mut self) -> f32 {
         self.ensure_space(BODY_LEADING);
         self.next_baseline(BODY_LEADING)
     }
 
-    fn draw_list_marker(&mut self, indent: f32, y: f32, marker: &str) {
-        self.draw_text(indent, y, marker, TextStyle::regular(BODY_SIZE));
+    fn draw_list_marker(&mut self, indent: f32, y: f32, marker: &Marker) {
+        match marker {
+            Marker::Text(text) => self.draw_text(indent, y, text, TextStyle::regular(BODY_SIZE)),
+            Marker::Task(checked) => self.draw_checkbox(indent, y, *checked),
+        }
     }
 
     fn render_list_continuation_lines(
@@ -562,7 +746,7 @@ impl Renderer {
         indent: f32,
         content_x: f32,
         max_width: f32,
-        marker: &str,
+        marker: &Marker,
     ) {
         let lines =
             self.wrap_spans_to_lines(spans, max_width, BODY_SIZE, false, &self.fonts.sans_regular);
@@ -583,7 +767,7 @@ impl Renderer {
         rest: &[Block],
         indent: f32,
         content_x: f32,
-        marker: &str,
+        marker: &Marker,
     ) {
         let y = self.reserve_list_line_baseline();
         self.draw_list_marker(indent, y, marker);
@@ -591,7 +775,7 @@ impl Renderer {
         self.render_list_item_blocks(rest, content_x);
     }
 
-    fn render_list_item_marker_only(&mut self, indent: f32, marker: &str) {
+    fn render_list_item_marker_only(&mut self, indent: f32, marker: &Marker) {
         let y = self.reserve_list_line_baseline();
         self.draw_list_marker(indent, y, marker);
     }
@@ -602,7 +786,7 @@ impl Renderer {
         indent: f32,
         content_x: f32,
         max_width: f32,
-        marker: &str,
+        marker: &Marker,
     ) {
         match item_blocks.split_first() {
             Some((Block::Paragraph { spans }, rest)) => {
@@ -617,13 +801,13 @@ impl Renderer {
         }
     }
 
-    fn render_list(&mut self, ordered: bool, start: u64, items: &[Vec<Block>], indent: f32) {
+    fn render_list(&mut self, ordered: bool, start: u64, items: &[ListItem], indent: f32) {
         let content_x = indent + LIST_INDENT;
         let max_width = (PAGE_WIDTH_PT - MARGIN_PT - content_x).max(1.0);
 
-        for (i, item_blocks) in items.iter().enumerate() {
-            let marker = Self::list_marker(ordered, start, i);
-            self.render_list_item(item_blocks, indent, content_x, max_width, &marker);
+        for (i, item) in items.iter().enumerate() {
+            let marker = Self::item_marker(ordered, start, i, item.task);
+            self.render_list_item(&item.blocks, indent, content_x, max_width, &marker);
         }
     }
 
@@ -637,25 +821,7 @@ impl Renderer {
         });
         self.ops.push(Op::SetOutlineThickness { pt: Pt(1.0) });
         self.ops.push(Op::DrawLine {
-            line: Line {
-                points: vec![
-                    LinePoint {
-                        p: Point {
-                            x: Pt(x0),
-                            y: Pt(y),
-                        },
-                        bezier: false,
-                    },
-                    LinePoint {
-                        p: Point {
-                            x: Pt(x0 + max_width),
-                            y: Pt(y),
-                        },
-                        bezier: false,
-                    },
-                ],
-                is_closed: false,
-            },
+            line: horizontal_line(x0, x0 + max_width, y),
         });
         self.ops.push(Op::RestoreGraphicsState);
         self.cursor_top += BODY_LEADING * 0.5;
@@ -791,14 +957,28 @@ mod tests {
     use super::*;
 
     fn word(text: &str, width: f32) -> Word {
-        Word {
+        let mut word = Word::default();
+        word.push(Fragment {
             text: text.to_string(),
             bold: false,
             italic: false,
             code: false,
+            strike: false,
             link: None,
             width,
-        }
+        });
+        word
+    }
+
+    fn line_texts(lines: &[Vec<Word>]) -> Vec<Vec<String>> {
+        lines
+            .iter()
+            .map(|l| {
+                l.iter()
+                    .map(|w| w.fragments.iter().map(|f| f.text.as_str()).collect())
+                    .collect()
+            })
+            .collect()
     }
 
     #[test]
@@ -809,11 +989,7 @@ mod tests {
             Token::Word(word("ccc", 30.0)),
         ];
         let lines = wrap_lines(tokens, 65.0, 5.0);
-        let texts: Vec<Vec<&str>> = lines
-            .iter()
-            .map(|l| l.iter().map(|w| w.text.as_str()).collect())
-            .collect();
-        assert_eq!(texts, vec![vec!["aaa", "bbb"], vec!["ccc"]]);
+        assert_eq!(line_texts(&lines), vec![vec!["aaa", "bbb"], vec!["ccc"]]);
     }
 
     #[test]
@@ -824,11 +1000,7 @@ mod tests {
             Token::Word(word("bbb", 10.0)),
         ];
         let lines = wrap_lines(tokens, 1000.0, 5.0);
-        let texts: Vec<Vec<&str>> = lines
-            .iter()
-            .map(|l| l.iter().map(|w| w.text.as_str()).collect())
-            .collect();
-        assert_eq!(texts, vec![vec!["aaa"], vec!["bbb"]]);
+        assert_eq!(line_texts(&lines), vec![vec!["aaa"], vec!["bbb"]]);
     }
 
     #[test]
@@ -888,6 +1060,153 @@ mod tests {
         for line in &lines {
             assert!(line_width(line, space_width) <= max_width);
         }
+    }
+
+    fn rendered_ops(blocks: &[Block]) -> Vec<Op> {
+        let mut renderer = Renderer::new().unwrap();
+        for block in blocks {
+            renderer.render_block(block, MARGIN_PT);
+        }
+        let mut ops: Vec<Op> = renderer.pages.iter().flat_map(|p| p.ops.clone()).collect();
+        ops.extend(renderer.ops);
+        ops
+    }
+
+    /// `(text, x, y)` of every text run, in drawing order.
+    fn text_runs(ops: &[Op]) -> Vec<(String, f32, f32)> {
+        let mut at = (0.0, 0.0);
+        let mut runs = Vec::new();
+        for op in ops {
+            match op {
+                Op::SetTextMatrix {
+                    matrix: TextMatrix::Translate(x, y),
+                } => at = (x.0, y.0),
+                Op::ShowText { items } => {
+                    for item in items {
+                        if let TextItem::Text(t) = item {
+                            runs.push((t.clone(), at.0, at.1));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        runs
+    }
+
+    fn lines_drawn(ops: &[Op]) -> Vec<&Line> {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::DrawLine { line } => Some(line),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn paragraph(spans: Vec<Span>) -> Block {
+        Block::Paragraph { spans }
+    }
+
+    #[test]
+    fn adjacent_styles_inside_a_word_get_no_space() {
+        let fonts = FontSet::load().unwrap();
+        let ops = rendered_ops(&[paragraph(vec![
+            Span::plain("foo"),
+            Span {
+                text: "bar".into(),
+                bold: true,
+                ..Default::default()
+            },
+            Span::plain(" baz"),
+        ])]);
+        let runs = text_runs(&ops);
+        let texts: Vec<&str> = runs.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(texts, ["foo", "bar", "baz"]);
+        let foo_width = text_width_pt(&fonts.sans_regular, "foo", BODY_SIZE);
+        let bar_width = text_width_pt(&fonts.sans_bold, "bar", BODY_SIZE);
+        let space = text_width_pt(&fonts.sans_regular, " ", BODY_SIZE);
+        assert!((runs[1].1 - (runs[0].1 + foo_width)).abs() < 0.01);
+        assert!((runs[2].1 - (runs[1].1 + bar_width + space)).abs() < 0.01);
+    }
+
+    #[test]
+    fn strikethrough_draws_a_line_through_the_struck_text_only() {
+        let fonts = FontSet::load().unwrap();
+        let struck = |t: &str| Span {
+            text: t.into(),
+            strike: true,
+            ..Default::default()
+        };
+        let ops = rendered_ops(&[paragraph(vec![
+            Span::plain("keep "),
+            struck("gone too"),
+            Span::plain(" keep"),
+        ])]);
+        let runs = text_runs(&ops);
+        let lines = lines_drawn(&ops);
+        assert_eq!(lines.len(), 1, "one continuous strike over both words");
+        let points = &lines[0].points;
+        let (gone_x, baseline) = (runs[1].1, runs[1].2);
+        let too_end = runs[2].1 + text_width_pt(&fonts.sans_regular, "too", BODY_SIZE);
+        assert!((points[0].p.x.0 - gone_x).abs() < 0.01);
+        assert!((points[1].p.x.0 - too_end).abs() < 0.01);
+        assert!(points[0].p.y.0 > baseline && points[0].p.y.0 < baseline + BODY_SIZE * 0.5);
+    }
+
+    #[test]
+    fn plain_text_draws_no_strike_line() {
+        let ops = rendered_ops(&[paragraph(vec![Span::plain("nothing struck")])]);
+        assert!(lines_drawn(&ops).is_empty());
+    }
+
+    fn list(items: Vec<(Option<bool>, &str)>) -> Block {
+        Block::List {
+            ordered: false,
+            start: 1,
+            items: items
+                .into_iter()
+                .map(|(task, text)| ListItem {
+                    task,
+                    blocks: vec![paragraph(vec![Span::plain(text)])],
+                })
+                .collect(),
+        }
+    }
+
+    fn rectangles(ops: &[Op]) -> Vec<&Rect> {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::DrawRectangle { rectangle } => Some(rectangle),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn task_items_draw_a_vector_box_instead_of_a_bullet() {
+        let ops = rendered_ops(&[list(vec![
+            (Some(true), "done"),
+            (Some(false), "todo"),
+            (None, "plain"),
+        ])]);
+        let runs = text_runs(&ops);
+        let texts: Vec<&str> = runs.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(texts, ["done", "todo", "\u{2022}", "plain"]);
+        // Task text lines up with bulleted text.
+        assert!((runs[0].1 - runs[3].1).abs() < 0.01);
+        assert!((runs[1].1 - runs[3].1).abs() < 0.01);
+
+        let boxes = rectangles(&ops);
+        assert_eq!(boxes.len(), 2, "one box per task item");
+        for (b, run) in boxes.iter().zip(&runs) {
+            assert!(b.x.0 >= MARGIN_PT && b.x.0 + b.width.0 < run.1);
+            assert!(b.y.0 < run.2 + BODY_SIZE && b.y.0 + b.height.0 > run.2);
+        }
+        let checks = lines_drawn(&ops)
+            .into_iter()
+            .filter(|l| l.points.len() == 3)
+            .count();
+        assert_eq!(checks, 1, "only the checked item gets a check mark");
     }
 
     #[test]

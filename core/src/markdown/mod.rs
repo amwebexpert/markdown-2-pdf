@@ -10,6 +10,7 @@ mod align;
 mod close;
 mod event;
 mod frame;
+mod html;
 mod open;
 mod stack;
 
@@ -20,7 +21,10 @@ use crate::ir::Block;
 use frame::Frame;
 
 pub fn parse(input: &str) -> Vec<Block> {
-    let parser = Parser::new_ext(input, Options::ENABLE_TABLES);
+    let parser = Parser::new_ext(
+        input,
+        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS,
+    );
     let mut stack: Vec<Frame> = vec![Frame::Container(Vec::new())];
 
     for event in parser {
@@ -127,7 +131,7 @@ mod tests {
                 assert_eq!(*start, 1);
                 assert_eq!(items.len(), 2);
                 for (item, text) in items.iter().zip(["one", "two"]) {
-                    match item.as_slice() {
+                    match item.blocks.as_slice() {
                         [Block::Paragraph { spans }] => assert_eq!(span_text(spans), text),
                         other => panic!("expected one paragraph, got {other:?}"),
                     }
@@ -144,6 +148,41 @@ mod tests {
             [Block::List { ordered, start, .. }] => {
                 assert!(ordered);
                 assert_eq!(*start, 3);
+            }
+            other => panic!("expected one list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_list_items_keep_checked_state_and_nesting() {
+        let blocks = parse("- [x] done\n- [ ] todo\n  - [x] nested\n- plain\n");
+        match blocks.as_slice() {
+            [Block::List { items, .. }] => {
+                let tasks: Vec<Option<bool>> = items.iter().map(|i| i.task).collect();
+                assert_eq!(tasks, [Some(true), Some(false), None]);
+                match items[1].blocks.as_slice() {
+                    [Block::Paragraph { spans }, Block::List { items: inner, .. }] => {
+                        assert_eq!(span_text(spans), "todo");
+                        assert_eq!(inner[0].task, Some(true));
+                        assert!(matches!(
+                            inner[0].blocks.as_slice(),
+                            [Block::Paragraph { spans }] if span_text(spans) == "nested"
+                        ));
+                    }
+                    other => panic!("expected paragraph then list, got {other:?}"),
+                }
+            }
+            other => panic!("expected one list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loose_task_list_items_keep_their_state() {
+        let blocks = parse("- [ ] a\n\n- [x] b\n");
+        match blocks.as_slice() {
+            [Block::List { items, .. }] => {
+                let tasks: Vec<Option<bool>> = items.iter().map(|i| i.task).collect();
+                assert_eq!(tasks, [Some(false), Some(true)]);
             }
             other => panic!("expected one list, got {other:?}"),
         }
@@ -240,7 +279,7 @@ mod tests {
         let blocks = parse("- outer\n  - inner\n");
         match blocks.as_slice() {
             [Block::List { items, .. }] => match items.as_slice() {
-                [item] => match item.as_slice() {
+                [item] => match item.blocks.as_slice() {
                     [Block::Paragraph { spans }, Block::List { items: inner, .. }] => {
                         assert_eq!(span_text(spans), "outer");
                         assert_eq!(inner.len(), 1);
@@ -258,7 +297,7 @@ mod tests {
         let blocks = parse("- first\n\n  second\n\n- third\n");
         match blocks.as_slice() {
             [Block::List { items, .. }] => {
-                let shapes: Vec<usize> = items.iter().map(Vec::len).collect();
+                let shapes: Vec<usize> = items.iter().map(|i| i.blocks.len()).collect();
                 assert_eq!(shapes, vec![2, 1]);
             }
             other => panic!("expected one list, got {other:?}"),
@@ -270,7 +309,7 @@ mod tests {
         let blocks = parse("- plain **bold** [link](u)\n");
         match blocks.as_slice() {
             [Block::List { items, .. }] => match items.as_slice() {
-                [item] => match item.as_slice() {
+                [item] => match item.blocks.as_slice() {
                     [Block::Paragraph { spans }] => {
                         assert_eq!(span_text(spans), "plain bold link");
                         assert!(spans.iter().any(|s| s.bold && s.text == "bold"));
@@ -309,10 +348,49 @@ mod tests {
     }
 
     #[test]
-    fn html_block_is_dropped() {
-        let blocks = parse("<div>\nhidden\n</div>\n\nafter");
+    fn blocks_before_an_html_block_are_kept() {
+        let blocks = parse("# Title\n\n<div>\nshown\n</div>\n\nafter");
         match blocks.as_slice() {
-            [Block::Paragraph { spans }] => assert_eq!(span_text(spans), "after"),
+            [
+                Block::Heading { spans: title, .. },
+                Block::CodeBlock { text },
+                Block::Paragraph { spans },
+            ] => {
+                assert_eq!(span_text(title), "Title");
+                assert_eq!(text, "<div>\nshown\n</div>\n");
+                assert_eq!(span_text(spans), "after");
+            }
+            other => panic!("expected heading, html, paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn html_comment_block_is_dropped() {
+        let blocks = parse("before\n\n<!-- hidden -->\n\nafter");
+        let texts: Vec<String> = blocks
+            .iter()
+            .map(|b| match b {
+                Block::Paragraph { spans } => span_text(spans),
+                other => panic!("expected paragraphs only, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(texts, ["before", "after"]);
+    }
+
+    #[test]
+    fn inline_br_tag_becomes_a_line_break() {
+        let blocks = parse("one<br>two<br />three");
+        match blocks.as_slice() {
+            [Block::Paragraph { spans }] => assert_eq!(span_text(spans), "one\ntwo\nthree"),
+            other => panic!("expected one paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_html_comment_is_dropped() {
+        let blocks = parse("a <!-- note --> b");
+        match blocks.as_slice() {
+            [Block::Paragraph { spans }] => assert_eq!(span_text(spans), "a  b"),
             other => panic!("expected one paragraph, got {other:?}"),
         }
     }
@@ -327,10 +405,35 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_extensions_fall_through_as_text() {
-        let blocks = parse("~~gone~~");
+    fn strikethrough_sets_strike_and_composes_with_other_styles() {
+        let blocks = parse("a ~~**b** [c](u)~~ d");
         match blocks.as_slice() {
-            [Block::Paragraph { spans }] => assert_eq!(span_text(spans), "~~gone~~"),
+            [Block::Paragraph { spans }] => {
+                assert_eq!(span_text(spans), "a b c d");
+                let struck: Vec<&str> = spans
+                    .iter()
+                    .filter(|s| s.strike)
+                    .map(|s| s.text.as_str())
+                    .collect();
+                assert_eq!(struck, ["b", " ", "c"]);
+                assert!(spans.iter().any(|s| s.strike && s.bold && s.text == "b"));
+                assert!(
+                    spans
+                        .iter()
+                        .any(|s| s.strike && s.link.as_deref() == Some("u"))
+                );
+            }
+            other => panic!("expected one paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn math_and_currency_dollars_stay_literal() {
+        let blocks = parse("Costs $5 and $10; $E = mc^2$");
+        match blocks.as_slice() {
+            [Block::Paragraph { spans }] => {
+                assert_eq!(span_text(spans), "Costs $5 and $10; $E = mc^2$");
+            }
             other => panic!("expected one paragraph, got {other:?}"),
         }
     }

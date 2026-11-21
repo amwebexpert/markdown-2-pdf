@@ -39,6 +39,7 @@ pub(super) fn push_span(stack: &mut Vec<Frame>, span: Span) {
         | Frame::Heading(spans)
         | Frame::Emphasis(spans)
         | Frame::Strong(spans)
+        | Frame::Strikethrough(spans)
         | Frame::Link { spans, .. }
         | Frame::TableCell(spans),
     ) = stack.last_mut()
@@ -55,7 +56,7 @@ pub(super) fn push_block(stack: &mut [Frame], block: Block) {
 
 pub(super) fn push_text(stack: &mut Vec<Frame>, text: &str) {
     match stack.last_mut() {
-        Some(Frame::CodeBlock(buf)) => buf.push_str(text),
+        Some(Frame::CodeBlock(buf) | Frame::HtmlBlock(buf)) => buf.push_str(text),
         Some(Frame::Image { alt }) => alt.push_str(text),
         _ => push_span(stack, Span::plain(text.to_string())),
     }
