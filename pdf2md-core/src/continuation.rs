@@ -4,7 +4,7 @@
 
 use crate::blocks::PageItems;
 use crate::layout::Item;
-use crate::tables::Table;
+use crate::tables::{Cell, Span, Table};
 
 /// A table's bottom (top) must lie within this share of the page height from
 /// the page bottom (top) for it to continue (be continued).
@@ -12,6 +12,8 @@ const EDGE_SHARE: f32 = 0.2;
 /// Column boundaries match within this many pt, or this share of the width.
 const BOUNDARY_PT: f32 = 3.0;
 const BOUNDARY_SHARE: f32 = 0.02;
+/// Only tables of at least this many columns are merged.
+const MIN_COLUMNS: usize = 2;
 
 /// Merges continued tables in place and returns a warning per merge.
 /// `boxes` holds each page's bounding box, `None` for failed pages.
@@ -87,7 +89,7 @@ fn same_columns(a: &Table, b: &Table) -> bool {
     let width = a.bbox[2] - a.bbox[0];
     let tolerance = BOUNDARY_PT.max(BOUNDARY_SHARE * width);
     a.columns.len() == b.columns.len()
-        && a.columns.len() >= 3
+        && a.columns.len() > MIN_COLUMNS // one boundary more than columns
         && a.columns
             .iter()
             .zip(&b.columns)
@@ -95,7 +97,7 @@ fn same_columns(a: &Table, b: &Table) -> bool {
 }
 
 /// Text of a row, whitespace and case ignored, to spot a repeated header.
-fn row_key(row: &[crate::tables::Cell]) -> String {
+fn row_key(row: &[Cell]) -> String {
     row.iter()
         .flatten()
         .flatten()
@@ -119,7 +121,7 @@ fn append(open: &mut Table, mut next: Table) {
         next.spans
             .into_iter()
             .filter(|span| span.row >= dropped)
-            .map(|span| crate::tables::Span {
+            .map(|span| Span {
                 row: span.row - dropped + offset,
                 ..span
             }),
@@ -132,7 +134,7 @@ mod tests {
     use super::*;
     use crate::font::FontStyle;
     use crate::interp::Glyph;
-    use crate::tables::{Align, Cell};
+    use crate::tables::{Align, Evidence};
 
     const PAGE: [f32; 4] = [0.0, 0.0, 612.0, 792.0];
 
@@ -167,7 +169,7 @@ mod tests {
                     .map(|r| r.iter().map(|t| cell(t)).collect())
                     .collect(),
                 spans: Vec::new(),
-                evidence: crate::tables::Evidence::Ruled,
+                evidence: Evidence::Ruled,
             },
         }
     }

@@ -22,13 +22,7 @@ struct Tolerance {
 
 impl Tolerance {
     fn for_glyphs(glyphs: &[Glyph]) -> Self {
-        let mut sizes: Vec<f32> = glyphs
-            .iter()
-            .filter(|g| !g.synthetic && g.size > 0.0)
-            .map(|g| g.size)
-            .collect();
-        sizes.sort_by(f32::total_cmp);
-        let size = sizes.get(sizes.len() / 2).copied().unwrap_or(0.0);
+        let size = median_glyph_size(glyphs.iter().filter(|g| !g.synthetic)).unwrap_or(0.0);
         Tolerance {
             collinear: COLLINEAR.max(COLLINEAR_SHARE * size),
             touch: TOUCH.max(TOUCH_SHARE * size),
@@ -41,6 +35,10 @@ const SAME_EXTENT: f32 = 3.0;
 const MIN_GRID_FILL: f32 = 0.3;
 /// Smallest share of non-empty cells for an alignment table.
 const MIN_ALIGNED_FILL: f32 = 0.6;
+/// Sweeps for gaps between text columns step this many times per pt.
+const SWEEP_STEPS_PER_PT: f32 = 2.0;
+/// A column opened by a header word needs text in this share of body rows.
+const MIN_HEADER_COLUMN_FILL: f32 = 0.5;
 /// A sparse candidate this close to `MIN_ALIGNED_FILL` (share of it) is a
 /// near miss, reported as ambiguous.
 const NEAR_MISS_SHARE: f32 = 0.8;
@@ -601,11 +599,11 @@ fn shared_gaps(
     min_gap: f32,
     misses: usize,
 ) -> Vec<(f32, f32)> {
-    let steps = ((right - left) * 2.0).max(0.0) as usize;
+    let steps = ((right - left) * SWEEP_STEPS_PER_PT).max(0.0) as usize;
     let mut gaps: Vec<(f32, f32)> = Vec::new();
     let mut run: Option<f32> = None;
     for step in 0..=steps {
-        let x = left + step as f32 / 2.0;
+        let x = left + step as f32 / SWEEP_STEPS_PER_PT;
         let covered = rows
             .iter()
             .filter(|row| row.iter().any(|p| x >= p.x0 && x <= p.x1))
@@ -669,14 +667,16 @@ pub fn aligned(rows: &[Vec<Piece>], min_gap: f32, misses: usize, merge: bool) ->
 /// Why aligned text was not taken for a table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rejected {
-    /// Too few rows, or no x range empty in (almost) every row.
+    /// No x range empty in (almost) every row.
     NoColumns,
+    /// Fewer than 2 rows, or fewer than 3 once wrapped rows are folded.
+    TooFewRows,
     /// A list with wide gaps after its markers, or code.
     OtherText,
     /// Equations with their numbers in a right-hand column.
     Equations,
-    /// Columns line up but too few cells have text (within 20% of the
-    /// threshold): a near miss worth reporting.
+    /// Columns line up but too few cells have text, though close to the
+    /// threshold (see `NEAR_MISS_SHARE`): a near miss worth reporting.
     Sparse,
     /// Columns line up but most cells are empty.
     Scattered,
@@ -697,7 +697,7 @@ pub fn verdict(
     merge: bool,
 ) -> Result<Table, Rejected> {
     if rows.len() < 2 {
-        return Err(Rejected::NoColumns);
+        return Err(Rejected::TooFewRows);
     }
     if other_aligned_text(rows) {
         return Err(Rejected::OtherText);
@@ -736,16 +736,16 @@ fn numbered_equations(table: &Table) -> bool {
         })
 }
 
-/// Median glyph size of the rows.
-fn median_size(rows: &[Vec<Piece>]) -> Option<f32> {
-    let mut sizes: Vec<f32> = rows
-        .iter()
-        .flatten()
-        .flat_map(|p| &p.glyphs)
-        .map(|g| g.size)
-        .collect();
+/// Median size of the glyphs that have one.
+fn median_glyph_size<'g>(glyphs: impl Iterator<Item = &'g Glyph>) -> Option<f32> {
+    let mut sizes: Vec<f32> = glyphs.map(|g| g.size).filter(|&s| s > 0.0).collect();
     sizes.sort_by(f32::total_cmp);
     sizes.get(sizes.len() / 2).copied()
+}
+
+/// Median glyph size of the rows.
+fn median_size(rows: &[Vec<Piece>]) -> Option<f32> {
+    median_glyph_size(rows.iter().flatten().flat_map(|p| &p.glyphs))
 }
 
 /// Column gaps read from the header row (`rows[0]`) when the columns are set
@@ -782,9 +782,9 @@ fn header_gaps(rows: &[Vec<Piece>], misses: usize) -> Vec<(f32, f32)> {
         .windows(2)
         .filter_map(|pair| {
             let [previous, word] = pair else { return None };
-            let steps = ((word.x0 - previous.x1) * 2.0).max(0.0) as usize;
+            let steps = ((word.x0 - previous.x1) * SWEEP_STEPS_PER_PT).max(0.0) as usize;
             (0..=steps)
-                .map(|step| word.x0 - step as f32 / 2.0)
+                .map(|step| word.x0 - step as f32 / SWEEP_STEPS_PER_PT)
                 .find(|&x| crossing(x) <= misses)
         })
         .collect();
@@ -796,15 +796,15 @@ fn header_gaps(rows: &[Vec<Piece>], misses: usize) -> Vec<(f32, f32)> {
             .iter()
             .filter(|row| row.iter().any(|w| w.x0 >= from && w.x0 < to))
             .count();
-        filled * 2 < body.len()
+        (filled as f32) < MIN_HEADER_COLUMN_FILL * body.len() as f32
     }) {
         edges.remove(k);
     }
     edges.into_iter().map(|edge| (edge, edge)).collect()
 }
 
-/// Builds the table for columns split at `gaps`; `None` when there is no
-/// gap or the table shape is too sparse. `merge` folds wrapped rows together
+/// Builds the table for columns split at `gaps`, or says why the rows are
+/// not one (no gap, too few rows once wrapped rows are folded, too sparse). `merge` folds wrapped rows together
 /// and then requires ≥ 3 rows.
 fn table_from_gaps(
     rows: &[Vec<Piece>],
@@ -832,7 +832,7 @@ fn table_from_gaps(
     if merge {
         merge_continuations(&mut table_rows, &mut boxes);
         if table_rows.len() < 3 {
-            return Err(Rejected::NoColumns);
+            return Err(Rejected::TooFewRows);
         }
     }
     let total = table_rows.len() * cols;
