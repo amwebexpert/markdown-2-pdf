@@ -12,6 +12,7 @@ use printpdf::{
 };
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 mod table;
 
@@ -41,6 +42,7 @@ const TABLE_FONT_SIZE: f32 = 10.0;
 const TABLE_ROW_LEADING: f32 = 13.0;
 const TABLE_CELL_PADDING: f32 = 4.0;
 const TABLE_BORDER_THICKNESS: f32 = 0.6;
+const TABLE_SPACING_BEFORE: f32 = 4.0;
 /// Narrowest column content width, so an empty column stays visible.
 const MIN_COLUMN_CONTENT: f32 = 10.0;
 /// Baseline distance below the top of a line box, as a fraction of leading —
@@ -416,27 +418,52 @@ fn column_demands(
     demands
 }
 
-/// Wraps every cell of a row within its column width and returns the row's
-/// total height — computed up front (separately from drawing) so a whole
-/// table's height is known before any of it is committed to the page.
-fn layout_table_row(
-    fonts: &FontSet,
-    col_widths: &[f32],
-    cells: &[Vec<Span>],
-    force_bold: bool,
-) -> (Vec<Vec<Vec<Word>>>, f32) {
-    let space_width = text_width_pt(&fonts.sans_regular, " ", TABLE_FONT_SIZE);
-    let mut cell_lines = Vec::with_capacity(col_widths.len());
-    for (i, &col_width) in col_widths.iter().enumerate() {
-        let spans = cells.get(i).cloned().unwrap_or_default();
-        let content_width = (col_width - TABLE_CELL_PADDING * 2.0).max(1.0);
-        let tokens = tokenize(&spans, fonts, TABLE_FONT_SIZE, force_bold);
-        let tokens = split_oversized_words(tokens, fonts, TABLE_FONT_SIZE, content_width);
-        cell_lines.push(wrap_lines(tokens, content_width, space_width));
+/// A table row wrapped to its column widths: lines per cell.
+struct RowLayout {
+    cells: Vec<Vec<Vec<Word>>>,
+    /// Line count of the tallest cell (at least 1).
+    lines: usize,
+}
+
+impl RowLayout {
+    /// Wraps every cell of a row within its column width — done up front
+    /// (separately from drawing) so pagination knows each row's height.
+    fn new(fonts: &FontSet, col_widths: &[f32], cells: &[Vec<Span>], force_bold: bool) -> Self {
+        let space_width = text_width_pt(&fonts.sans_regular, " ", TABLE_FONT_SIZE);
+        let mut wrapped = Vec::with_capacity(col_widths.len());
+        for (i, &col_width) in col_widths.iter().enumerate() {
+            let spans = cells.get(i).cloned().unwrap_or_default();
+            let content_width = (col_width - TABLE_CELL_PADDING * 2.0).max(1.0);
+            let tokens = tokenize(&spans, fonts, TABLE_FONT_SIZE, force_bold);
+            let tokens = split_oversized_words(tokens, fonts, TABLE_FONT_SIZE, content_width);
+            wrapped.push(wrap_lines(tokens, content_width, space_width));
+        }
+        let lines = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
+        RowLayout {
+            cells: wrapped,
+            lines,
+        }
     }
-    let line_count = cell_lines.iter().map(|l| l.len().max(1)).max().unwrap_or(1);
-    let height = line_count as f32 * TABLE_ROW_LEADING + TABLE_CELL_PADDING * 2.0;
-    (cell_lines, height)
+
+    fn height(&self) -> f32 {
+        row_height(self.lines)
+    }
+}
+
+/// Height of a row (or row part) showing `lines` lines.
+fn row_height(lines: usize) -> f32 {
+    lines as f32 * TABLE_ROW_LEADING + TABLE_CELL_PADDING * 2.0
+}
+
+/// Shared geometry of one table being drawn.
+struct TableFrame<'t> {
+    x0: f32,
+    col_widths: &'t [f32],
+    alignments: &'t [Align],
+    header: &'t RowLayout,
+    /// False for a header too tall to repeat (over half a page): it is then
+    /// drawn once, split like any tall row.
+    repeat_header: bool,
 }
 
 struct FontIds {
@@ -937,6 +964,18 @@ impl<'a> Renderer<'a> {
         self.cursor_top += BODY_LEADING * 0.5;
     }
 
+    fn page_bottom() -> f32 {
+        PAGE_HEIGHT_PT - MARGIN_PT
+    }
+
+    fn at_page_top(&self) -> bool {
+        self.cursor_top <= MARGIN_PT
+    }
+
+    /// Tables paginate row by row: the header is kept with the first row and
+    /// repeated at the top of every continuation page. A row never splits
+    /// unless it is taller than a whole page under the header; then it is cut
+    /// between lines, each part with its own borders.
     fn render_table(
         &mut self,
         alignments: &[Align],
@@ -952,46 +991,85 @@ impl<'a> Renderer<'a> {
 
         let demands = column_demands(&self.fonts, num_cols, header, rows);
         let col_widths = column_widths(&demands, available_width);
-
-        let (header_lines, header_height) =
-            layout_table_row(&self.fonts, &col_widths, header, true);
-        let row_layouts: Vec<(Vec<Vec<Vec<Word>>>, f32)> = rows
+        let header = RowLayout::new(&self.fonts, &col_widths, header, true);
+        let rows: Vec<RowLayout> = rows
             .iter()
-            .map(|r| layout_table_row(&self.fonts, &col_widths, r, false))
+            .map(|r| RowLayout::new(&self.fonts, &col_widths, r, false))
             .collect();
-        let total_height: f32 = header_height + row_layouts.iter().map(|(_, h)| h).sum::<f32>();
+        let frame = TableFrame {
+            x0,
+            col_widths: &col_widths,
+            alignments,
+            header: &header,
+            repeat_header: header.height() <= (Self::page_bottom() - MARGIN_PT) / 2.0,
+        };
 
-        if self.cursor_top > MARGIN_PT
-            && self.cursor_top + total_height > PAGE_HEIGHT_PT - MARGIN_PT
+        // Keep the header with the first row (or the first line of it).
+        let first = rows.first().map_or(0.0, |r| row_height(r.lines.min(1)));
+        if !self.at_page_top()
+            && self.cursor_top + TABLE_SPACING_BEFORE + header.height() + first
+                > Self::page_bottom()
         {
             self.new_page();
         }
-
-        self.cursor_top += 4.0;
-        self.draw_table_row(&col_widths, alignments, &header_lines, header_height, x0);
-        for (lines, height) in &row_layouts {
-            self.ensure_space(*height);
-            self.draw_table_row(&col_widths, alignments, lines, *height, x0);
+        self.cursor_top += TABLE_SPACING_BEFORE;
+        if frame.repeat_header {
+            self.draw_row_part(&frame, &header, 0..header.lines);
+        } else {
+            self.draw_table_row(&frame, &header);
+        }
+        for row in &rows {
+            self.draw_table_row(&frame, row);
         }
         self.cursor_top += PARAGRAPH_SPACING_AFTER;
     }
 
-    fn draw_table_row(
-        &mut self,
-        col_widths: &[f32],
-        alignments: &[Align],
-        cell_lines: &[Vec<Vec<Word>>],
-        row_height: f32,
-        x0: f32,
-    ) {
+    fn continue_table_on_new_page(&mut self, frame: &TableFrame<'_>) {
+        self.new_page();
+        if frame.repeat_header {
+            self.draw_row_part(frame, frame.header, 0..frame.header.lines);
+        }
+    }
+
+    fn draw_table_row(&mut self, frame: &TableFrame<'_>, row: &RowLayout) {
+        let repeated = if frame.repeat_header {
+            frame.header.height()
+        } else {
+            0.0
+        };
+        let fresh_page_room = Self::page_bottom() - MARGIN_PT - repeated;
+        if self.cursor_top + row.height() > Self::page_bottom() && row.height() <= fresh_page_room {
+            self.continue_table_on_new_page(frame);
+        }
+        let mut from = 0;
+        while from < row.lines {
+            // Whole lines that fit under the cursor; a fresh page fits one.
+            let fit = (1..=row.lines - from)
+                .take_while(|&n| self.cursor_top + row_height(n) <= Self::page_bottom())
+                .count();
+            if fit == 0 {
+                self.continue_table_on_new_page(frame);
+                continue;
+            }
+            self.draw_row_part(frame, row, from..from + fit);
+            from += fit;
+            if from < row.lines {
+                self.continue_table_on_new_page(frame);
+            }
+        }
+    }
+
+    /// Draws lines `range` of every cell of `row` as one bordered row.
+    fn draw_row_part(&mut self, frame: &TableFrame<'_>, row: &RowLayout, range: Range<usize>) {
+        let row_height = row_height(range.len());
         let row_top = self.cursor_top;
         self.cursor_top += row_height;
         let row_top_pdf_y = PAGE_HEIGHT_PT - row_top;
         let row_bottom_pdf_y = row_top_pdf_y - row_height;
         let space_width = text_width_pt(&self.fonts.sans_regular, " ", TABLE_FONT_SIZE);
 
-        let mut x = x0;
-        for (i, &w) in col_widths.iter().enumerate() {
+        let mut x = frame.x0;
+        for (i, &w) in frame.col_widths.iter().enumerate() {
             self.ops.push(Op::SaveGraphicsState);
             self.ops.push(Op::SetOutlineColor {
                 col: rgb(BORDER_GREY),
@@ -1013,21 +1091,23 @@ impl<'a> Renderer<'a> {
 
             let text_x0 = x + TABLE_CELL_PADDING;
             let content_width = (w - TABLE_CELL_PADDING * 2.0).max(1.0);
-            let align = alignments.get(i).copied().unwrap_or(Align::None);
-            if let Some(lines) = cell_lines.get(i) {
-                for (li, line) in lines.iter().enumerate() {
-                    let lw = line_width(line, space_width);
-                    let extra = (content_width - lw).max(0.0);
-                    let start_x = match align {
-                        Align::Right => text_x0 + extra,
-                        Align::Center => text_x0 + extra / 2.0,
-                        Align::Left | Align::None => text_x0,
-                    };
-                    let baseline_y = row_top_pdf_y
-                        - TABLE_CELL_PADDING
-                        - (li as f32 + BASELINE_RATIO) * TABLE_ROW_LEADING;
-                    self.render_line(line, start_x, baseline_y, TABLE_FONT_SIZE);
-                }
+            let align = frame.alignments.get(i).copied().unwrap_or(Align::None);
+            let lines = row.cells.get(i).map_or(&[][..], Vec::as_slice);
+            let shown = lines
+                .get(range.start..range.end.min(lines.len()))
+                .unwrap_or_default();
+            for (li, line) in shown.iter().enumerate() {
+                let lw = line_width(line, space_width);
+                let extra = (content_width - lw).max(0.0);
+                let start_x = match align {
+                    Align::Right => text_x0 + extra,
+                    Align::Center => text_x0 + extra / 2.0,
+                    Align::Left | Align::None => text_x0,
+                };
+                let baseline_y = row_top_pdf_y
+                    - TABLE_CELL_PADDING
+                    - (li as f32 + BASELINE_RATIO) * TABLE_ROW_LEADING;
+                self.render_line(line, start_x, baseline_y, TABLE_FONT_SIZE);
             }
             x += w;
         }
@@ -1705,6 +1785,116 @@ mod tests {
         );
         let longest = text_width_pt(&fonts.sans_regular, "regular", TABLE_FONT_SIZE);
         assert!((demand.min - (longest + 2.0 * TABLE_CELL_PADDING)).abs() < 0.01);
+    }
+
+    fn page_texts(rendered: &Rendered) -> Vec<Vec<String>> {
+        rendered
+            .pages
+            .iter()
+            .map(|ops| text_runs(ops).into_iter().map(|r| r.0).collect())
+            .collect()
+    }
+
+    fn numbered_rows(count: usize) -> Vec<Vec<String>> {
+        (1..=count)
+            .map(|i| vec![format!("row{i}"), format!("value{i}")])
+            .collect()
+    }
+
+    #[test]
+    fn long_table_repeats_its_header_on_every_page() {
+        let rendered = render_with(
+            &[table(&["Name", "Value"], &numbered_rows(120))],
+            &Images::new(),
+        );
+        let pages = page_texts(&rendered);
+        assert!(pages.len() >= 3, "{} pages", pages.len());
+        for (i, texts) in pages.iter().enumerate() {
+            assert_eq!(texts[..2], ["Name", "Value"], "page {}", i + 1);
+        }
+        // Every row appears exactly once, in order.
+        let rows: Vec<&String> = pages
+            .iter()
+            .flatten()
+            .filter(|t| t.starts_with("row"))
+            .collect();
+        let expected: Vec<String> = (1..=120).map(|i| format!("row{i}")).collect();
+        assert_eq!(rows, expected.iter().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn long_table_starts_on_the_current_page_instead_of_leaving_it_blank() {
+        let mut blocks = vec![paragraph(vec![Span::plain("intro")])];
+        blocks.push(table(&["Name", "Value"], &numbered_rows(120)));
+        let pages = page_texts(&render_with(&blocks, &Images::new()));
+        assert_eq!(pages[0][..3], ["intro", "Name", "Value"]);
+    }
+
+    #[test]
+    fn header_is_never_left_alone_at_the_bottom_of_a_page() {
+        // 28 one-line paragraphs (22 pt each) leave 32 pt: room for the
+        // header row (4 + 21 pt) but not for header + first row (46 pt).
+        let filler: Vec<Block> = (0..28).map(|_| paragraph(vec![Span::plain("x")])).collect();
+        let rendered = {
+            let mut blocks = filler;
+            blocks.push(table(&["Name", "Value"], &numbered_rows(3)));
+            render_with(&blocks, &Images::new())
+        };
+        let pages = page_texts(&rendered);
+        assert_eq!(pages.len(), 2);
+        assert!(!pages[0].contains(&"Name".to_string()), "{pages:?}");
+        assert_eq!(pages[1][..3], ["Name", "Value", "row1"]);
+    }
+
+    #[test]
+    fn row_taller_than_a_page_is_split_between_lines_on_every_page() {
+        let cell: Vec<String> = (1..=120).map(|i| format!("line{i}")).collect();
+        // Hard breaks in the cell, as the parser emits for `<br>`.
+        let rows = vec![vec!["key".to_string(), cell.join("\n")]];
+        let block = table(&["Name", "Value"], &rows);
+        let rendered = render_with(&[block], &Images::new());
+        let pages = page_texts(&rendered);
+        assert!(pages.len() >= 2, "{} pages", pages.len());
+        let lines: Vec<&String> = pages
+            .iter()
+            .flatten()
+            .filter(|t| t.starts_with("line"))
+            .collect();
+        assert_eq!(lines.len(), 120, "every line drawn once");
+        for (i, boxes) in cell_boxes(&rendered).iter().enumerate() {
+            for rect in boxes {
+                assert!(
+                    rect.y.0 >= MARGIN_PT - 0.01,
+                    "page {} box below margin",
+                    i + 1
+                );
+                assert!(rect.y.0 + rect.height.0 <= PAGE_HEIGHT_PT - MARGIN_PT + 0.01);
+            }
+        }
+        for texts in &pages {
+            assert_eq!(texts[..2], ["Name", "Value"]);
+        }
+    }
+
+    #[test]
+    fn header_taller_than_a_page_is_split_and_not_repeated() {
+        let huge: String = (1..=80)
+            .map(|i| format!("h{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let block = Block::Table {
+            alignments: vec![Align::None],
+            header: vec![vec![Span::plain(huge)]],
+            rows: vec![vec![vec![Span::plain("body")]]],
+        };
+        let pages = page_texts(&render_with(&[block], &Images::new()));
+        let header_lines = pages
+            .iter()
+            .flatten()
+            .filter(|t| t.starts_with('h'))
+            .count();
+        assert_eq!(header_lines, 80, "header drawn exactly once");
+        assert!(pages.iter().flatten().any(|t| t == "body"));
     }
 
     #[test]
