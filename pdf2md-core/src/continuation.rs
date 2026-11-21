@@ -110,9 +110,20 @@ fn append(open: &mut Table, mut next: Table) {
         (Some(header), Some(first)) => row_key(header) == row_key(first),
         _ => false,
     };
+    let dropped = usize::from(repeats_header);
     if repeats_header {
         next.rows.remove(0);
     }
+    let offset = open.rows.len();
+    open.spans.extend(
+        next.spans
+            .into_iter()
+            .filter(|span| span.row >= dropped)
+            .map(|span| crate::tables::Span {
+                row: span.row - dropped + offset,
+                ..span
+            }),
+    );
     open.rows.extend(next.rows);
 }
 
@@ -155,6 +166,8 @@ mod tests {
                     .iter()
                     .map(|r| r.iter().map(|t| cell(t)).collect())
                     .collect(),
+                spans: Vec::new(),
+                evidence: crate::tables::Evidence::Ruled,
             },
         }
     }

@@ -173,6 +173,18 @@ pub fn convert(pdf: &[u8], options: &Options) -> Result<Output, Pdf2MdError> {
         &mut page_items,
         &page_boxes,
     ));
+    warnings.extend(page_items.iter().flat_map(|page| {
+        match page {
+            PageItems::Items(items) => items
+                .iter()
+                .filter_map(|item| match item {
+                    layout::Item::Table { page, table } => table.flattened_warning(*page),
+                    _ => None,
+                })
+                .collect(),
+            PageItems::Failed(_) => Vec::new(),
+        }
+    }));
 
     let mut assets = Assets::new(&doc, &options.images);
     let blocks = blocks::build(page_items, &mut |number, index| {

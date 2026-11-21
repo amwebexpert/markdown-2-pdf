@@ -27,6 +27,27 @@ pub enum Align {
 /// One table cell: its text lines, glyphs sorted left to right.
 pub type Cell = Vec<Vec<Glyph>>;
 
+/// What a table was recognised from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Evidence {
+    /// A grid of drawn rulings (cell borders or line grid).
+    Ruled,
+    /// Horizontal rules only (booktabs top/mid/bottom rules).
+    RuleOnly,
+    /// Text columns lining up, no rulings.
+    Aligned,
+}
+
+/// A merged cell: `rows × cols` grid cells from (`row`, `col`), its text in
+/// that first cell. GFM has no spans, so it is emitted flattened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub row: usize,
+    pub col: usize,
+    pub rows: usize,
+    pub cols: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct Table {
     /// `[x0, y0, x1, y1]` in user space.
@@ -37,6 +58,21 @@ pub struct Table {
     pub align: Vec<Align>,
     /// `rows[0]` is the header row; every row has `align.len()` cells.
     pub rows: Vec<Vec<Cell>>,
+    /// Merged cells (ruled grids with a missing inner border).
+    pub spans: Vec<Span>,
+    pub evidence: Evidence,
+}
+
+impl Table {
+    /// Warning for a table whose merged cells can't be represented in GFM.
+    pub fn flattened_warning(&self, page: u32) -> Option<String> {
+        (!self.spans.is_empty()).then(|| {
+            format!(
+                "page {page}: table has merged cells; GFM can't span them, so each keeps its \
+                 text in its first cell"
+            )
+        })
+    }
 }
 
 /// Horizontal extent of a piece of text on one line.
@@ -307,15 +343,8 @@ fn grid(
         return Err(rest);
     }
 
-    let spanning: Vec<bool> = (0..rows * cols)
-        .map(|i| {
-            let root = find(&mut parent, i);
-            (0..rows * cols)
-                .filter(|&j| find(&mut parent, j) == root)
-                .count()
-                > 1
-        })
-        .collect();
+    let roots: Vec<usize> = (0..rows * cols).map(|i| find(&mut parent, i)).collect();
+    let (spanning, spans) = merged_cells(&roots, cols);
     let mut cells = cell_glyphs.into_iter().map(text_lines);
     let table_rows: Vec<Vec<Cell>> = (0..rows)
         .map(|_| cells.by_ref().take(cols).collect())
@@ -336,9 +365,37 @@ fn grid(
             columns: xs,
             align,
             rows: table_rows,
+            spans,
+            evidence: Evidence::Ruled,
         },
         rest,
     ))
+}
+
+/// Which grid cells belong to a merged group (`roots[i]` is cell `i`'s
+/// group anchor), and the groups as spans.
+fn merged_cells(roots: &[usize], cols: usize) -> (Vec<bool>, Vec<Span>) {
+    let size = |root: usize| roots.iter().filter(|r| **r == root).count();
+    let spanning = roots.iter().map(|&root| size(root) > 1).collect();
+    let spans = roots
+        .iter()
+        .enumerate()
+        .filter(|&(i, &root)| i == root && size(root) > 1)
+        .map(|(anchor, _)| {
+            let members = roots.iter().enumerate().filter(|&(_, &r)| r == anchor);
+            let (rs, cs): (Vec<usize>, Vec<usize>) =
+                members.map(|(i, _)| (i / cols, i % cols)).unzip();
+            let extent =
+                |v: &[usize]| v.iter().max().unwrap_or(&0) - v.iter().min().unwrap_or(&0) + 1;
+            Span {
+                row: anchor / cols,
+                col: anchor % cols,
+                rows: extent(&rs),
+                cols: extent(&cs),
+            }
+        })
+        .collect();
+    (spanning, spans)
 }
 
 /// Horizontal extent of a cell's text.
@@ -438,6 +495,7 @@ fn booktabs(rules: Vec<Ruling>, glyphs: &mut Vec<Glyph>) -> (Vec<Table>, Vec<Rul
         *glyphs = outer;
         if let Some(mut table) = aligned(&rows, 0.8, misses, false) {
             table.bbox = [from, bottom, to, top];
+            table.evidence = Evidence::RuleOnly;
             tables.push(table);
         } else {
             glyphs.extend(inner);
@@ -620,6 +678,8 @@ pub fn aligned(rows: &[Vec<Piece>], min_gap: f32, misses: usize, merge: bool) ->
         columns,
         align,
         rows: table_rows,
+        spans: Vec::new(),
+        evidence: Evidence::Aligned,
     })
 }
 
@@ -795,6 +855,39 @@ mod tests {
         glyphs.extend(word("b", 204.0, 666.0));
         let table = ruled(&rulings, glyphs).tables.remove(0);
         assert_eq!(texts(&table), [["Widetitle", ""], ["a", "b"]]);
+        assert_eq!(
+            table.spans,
+            [Span {
+                row: 0,
+                col: 0,
+                rows: 1,
+                cols: 2
+            }]
+        );
+        assert_eq!(table.evidence, Evidence::Ruled);
+        assert_eq!(
+            table.flattened_warning(3).as_deref(),
+            Some(
+                "page 3: table has merged cells; GFM can't span them, so each keeps its text in its first cell"
+            )
+        );
+    }
+
+    #[test]
+    fn tables_without_spans_need_no_warning() {
+        let rulings = vec![
+            h(700.0, 100.0, 300.0),
+            h(680.0, 100.0, 300.0),
+            h(660.0, 100.0, 300.0),
+            v(100.0, 660.0, 700.0),
+            v(200.0, 660.0, 700.0),
+            v(300.0, 660.0, 700.0),
+        ];
+        let mut glyphs = word("a", 104.0, 686.0);
+        glyphs.extend(word("b", 204.0, 666.0));
+        let table = ruled(&rulings, glyphs).tables.remove(0);
+        assert!(table.spans.is_empty());
+        assert_eq!(table.flattened_warning(1), None);
     }
 
     #[test]
