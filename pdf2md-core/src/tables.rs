@@ -3,10 +3,38 @@
 
 use crate::interp::{Glyph, Ruling};
 
-/// Rulings this close (pt) across their axis are collinear.
+/// Rulings this close (pt) across their axis are collinear, at least; the
+/// actual tolerance grows with the text size (see `Tolerance`).
 const COLLINEAR: f32 = 1.0;
 /// Rulings this close (pt) along their axis, or across each other, touch.
 const TOUCH: f32 = 2.0;
+/// Collinear / touch tolerances as a share of the median glyph size, so a
+/// divider drawn 1.5 pt off or a rule broken by 3 pt still lines up.
+const COLLINEAR_SHARE: f32 = 0.2;
+const TOUCH_SHARE: f32 = 0.4;
+
+/// Geometric tolerances (pt) for one page, scaled to its text.
+#[derive(Debug, Clone, Copy)]
+struct Tolerance {
+    collinear: f32,
+    touch: f32,
+}
+
+impl Tolerance {
+    fn for_glyphs(glyphs: &[Glyph]) -> Self {
+        let mut sizes: Vec<f32> = glyphs
+            .iter()
+            .filter(|g| !g.synthetic && g.size > 0.0)
+            .map(|g| g.size)
+            .collect();
+        sizes.sort_by(f32::total_cmp);
+        let size = sizes.get(sizes.len() / 2).copied().unwrap_or(0.0);
+        Tolerance {
+            collinear: COLLINEAR.max(COLLINEAR_SHARE * size),
+            touch: TOUCH.max(TOUCH_SHARE * size),
+        }
+    }
+}
 /// Rule-only tables: rules whose ends differ by at most this (pt) align.
 const SAME_EXTENT: f32 = 3.0;
 /// Smallest share of non-empty cells for a ruled grid to be a table.
@@ -119,7 +147,7 @@ pub fn text_lines(glyphs: Vec<Glyph>) -> Vec<Vec<Glyph>> {
 
 /// Merges overlapping or touching collinear rulings (md2pdf strokes every
 /// cell rectangle, so shared edges are drawn twice).
-fn merge(mut rulings: Vec<Ruling>) -> Vec<Ruling> {
+fn merge(mut rulings: Vec<Ruling>, tolerance: Tolerance) -> Vec<Ruling> {
     rulings.sort_by(|a, b| a.pos.total_cmp(&b.pos));
     let mut groups: Vec<Vec<Ruling>> = Vec::new();
     for ruling in rulings {
@@ -127,7 +155,7 @@ fn merge(mut rulings: Vec<Ruling>) -> Vec<Ruling> {
             Some(group)
                 if group
                     .first()
-                    .is_some_and(|f| ruling.pos - f.pos <= COLLINEAR) =>
+                    .is_some_and(|f| ruling.pos - f.pos <= tolerance.collinear) =>
             {
                 group.push(ruling);
             }
@@ -140,7 +168,7 @@ fn merge(mut rulings: Vec<Ruling>) -> Vec<Ruling> {
         let mut current: Option<Ruling> = None;
         for ruling in group {
             match current.as_mut() {
-                Some(c) if ruling.from <= c.to + TOUCH => c.to = c.to.max(ruling.to),
+                Some(c) if ruling.from <= c.to + tolerance.touch => c.to = c.to.max(ruling.to),
                 _ => merged.extend(current.replace(ruling)),
             }
         }
@@ -149,11 +177,11 @@ fn merge(mut rulings: Vec<Ruling>) -> Vec<Ruling> {
     merged
 }
 
-fn touches(h: &Ruling, v: &Ruling) -> bool {
-    v.pos >= h.from - TOUCH
-        && v.pos <= h.to + TOUCH
-        && h.pos >= v.from - TOUCH
-        && h.pos <= v.to + TOUCH
+fn touches(h: &Ruling, v: &Ruling, touch: f32) -> bool {
+    v.pos >= h.from - touch
+        && v.pos <= h.to + touch
+        && h.pos >= v.from - touch
+        && h.pos <= v.to + touch
 }
 
 fn find(parent: &mut [usize], mut i: usize) -> usize {
@@ -196,16 +224,17 @@ pub struct Ruled {
 
 /// Detects grid and rule-only tables, taking their glyphs out of the page.
 pub fn ruled(rulings: &[Ruling], glyphs: Vec<Glyph>) -> Ruled {
+    let tolerance = Tolerance::for_glyphs(&glyphs);
     let (horizontal, vertical): (Vec<Ruling>, Vec<Ruling>) =
         rulings.iter().partition(|r| r.horizontal);
-    let horizontal = merge(horizontal);
-    let vertical = merge(vertical);
+    let horizontal = merge(horizontal, tolerance);
+    let vertical = merge(vertical, tolerance);
 
     let all: Vec<&Ruling> = horizontal.iter().chain(&vertical).collect();
     let mut parent: Vec<usize> = (0..all.len()).collect();
     for (i, h) in horizontal.iter().enumerate() {
         for (j, v) in vertical.iter().enumerate() {
-            if touches(h, v) {
+            if touches(h, v, tolerance.touch) {
                 union(&mut parent, i, horizontal.len() + j);
             }
         }
@@ -243,7 +272,7 @@ pub fn ruled(rulings: &[Ruling], glyphs: Vec<Glyph>) -> Ruled {
             .collect();
         if hs.len() >= 2 && vs.len() >= 2 {
             let remaining = std::mem::take(&mut out.glyphs);
-            match grid(&hs, &vs, remaining) {
+            match grid(&hs, &vs, remaining, tolerance) {
                 Ok((table, rest)) => {
                     out.tables.push(table);
                     out.glyphs = rest;
@@ -267,9 +296,11 @@ fn grid(
     hs: &[Ruling],
     vs: &[Ruling],
     glyphs: Vec<Glyph>,
+    tolerance: Tolerance,
 ) -> Result<(Table, Vec<Glyph>), Vec<Glyph>> {
-    let xs = distinct(vs.iter().map(|r| r.pos).collect(), COLLINEAR);
-    let mut ys = distinct(hs.iter().map(|r| r.pos).collect(), COLLINEAR);
+    let collinear = tolerance.collinear;
+    let xs = distinct(vs.iter().map(|r| r.pos).collect(), collinear);
+    let mut ys = distinct(hs.iter().map(|r| r.pos).collect(), collinear);
     ys.reverse(); // top-down
     let (Some(&left), Some(&right), Some(&top), Some(&bottom)) =
         (xs.first(), xs.last(), ys.first(), ys.last())
@@ -295,11 +326,11 @@ fn grid(
             let mid_x = f32::midpoint(x_at(c), x_at(c + 1));
             let has_v = |x: f32| {
                 vs.iter()
-                    .any(|v| (v.pos - x).abs() <= COLLINEAR && v.from <= mid_y && v.to >= mid_y)
+                    .any(|v| (v.pos - x).abs() <= collinear && v.from <= mid_y && v.to >= mid_y)
             };
             let has_h = |y: f32| {
                 hs.iter()
-                    .any(|h| (h.pos - y).abs() <= COLLINEAR && h.from <= mid_x && h.to >= mid_x)
+                    .any(|h| (h.pos - y).abs() <= collinear && h.from <= mid_x && h.to >= mid_x)
             };
             if c + 1 < cols && !has_v(x_at(c + 1)) {
                 union(&mut parent, index(r, c), index(r, c + 1));
@@ -904,7 +935,10 @@ mod tests {
     #[test]
     fn per_cell_rectangles_merge_into_one_grid() {
         let rulings = cell_rects(&[100.0, 200.0, 300.0], &[700.0, 680.0, 660.0]);
-        let merged = merge(rulings.iter().filter(|r| r.horizontal).copied().collect());
+        let merged = merge(
+            rulings.iter().filter(|r| r.horizontal).copied().collect(),
+            Tolerance::for_glyphs(&[]),
+        );
         assert_eq!(merged.len(), 3);
         assert!(
             merged
@@ -973,6 +1007,69 @@ mod tests {
         let table = ruled(&rulings, glyphs).tables.remove(0);
         assert!(table.spans.is_empty());
         assert_eq!(table.flattened_warning(1), None);
+    }
+
+    /// A 2 × 2 grid's glyphs: header a/b, body c/d.
+    fn two_by_two_glyphs() -> Vec<Glyph> {
+        let mut glyphs = word("a", 104.0, 686.0);
+        glyphs.extend(word("b", 204.0, 686.0));
+        glyphs.extend(word("c", 104.0, 666.0));
+        glyphs.extend(word("d", 204.0, 666.0));
+        glyphs
+    }
+
+    #[test]
+    fn slightly_misaligned_dividers_are_one_column_edge() {
+        // The middle divider is drawn per row, 1.5 pt apart.
+        let rulings = vec![
+            h(700.0, 100.0, 300.0),
+            h(680.0, 100.0, 300.0),
+            h(660.0, 100.0, 300.0),
+            v(100.0, 660.0, 700.0),
+            v(300.0, 660.0, 700.0),
+            v(200.0, 680.0, 700.0),
+            v(201.5, 660.0, 680.0),
+        ];
+        let table = ruled(&rulings, two_by_two_glyphs()).tables.remove(0);
+        assert_eq!(texts(&table), [["a", "b"], ["c", "d"]]);
+        assert!(table.spans.is_empty());
+    }
+
+    #[test]
+    fn rule_broken_by_a_small_gap_still_separates_rows() {
+        // The middle rule has a 3 pt gap right where the first cell's middle is.
+        let rulings = vec![
+            h(700.0, 100.0, 300.0),
+            h(680.0, 100.0, 148.5),
+            h(680.0, 151.5, 300.0),
+            h(660.0, 100.0, 300.0),
+            v(100.0, 660.0, 700.0),
+            v(200.0, 660.0, 700.0),
+            v(300.0, 660.0, 700.0),
+        ];
+        let table = ruled(&rulings, two_by_two_glyphs()).tables.remove(0);
+        assert_eq!(texts(&table), [["a", "b"], ["c", "d"]]);
+        assert!(table.spans.is_empty());
+    }
+
+    #[test]
+    fn text_centred_in_a_tall_row_and_text_touching_a_border_stay_in_their_cells() {
+        let rulings = vec![
+            h(700.0, 100.0, 300.0),
+            h(680.0, 100.0, 300.0),
+            h(620.0, 100.0, 300.0),
+            v(100.0, 620.0, 700.0),
+            v(200.0, 620.0, 700.0),
+            v(300.0, 620.0, 700.0),
+        ];
+        let mut glyphs = word("a", 104.0, 686.0);
+        glyphs.extend(word("b", 204.0, 686.0));
+        // Centred in a 60 pt row, and a word whose last glyph overlaps the divider.
+        glyphs.extend(word("mid", 130.0, 647.0));
+        glyphs.extend(word("edge", 181.0, 630.0));
+        glyphs.extend(word("x", 250.0, 647.0));
+        let table = ruled(&rulings, glyphs).tables.remove(0);
+        assert_eq!(texts(&table), [["a", "b"], ["mid/edge", "x"]]);
     }
 
     #[test]
