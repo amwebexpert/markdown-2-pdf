@@ -15,11 +15,9 @@ pub struct Span {
     pub superscript: bool,
     /// Set on the `[image: alt]` fallback span of an image, so a paragraph
     /// holding only images can become [`Block::Image`]s.
-    pub image: Option<ImageRef>,
+    pub image: Option<Image>,
     pub link: Option<String>,
 }
-
-const IMAGE_FALLBACK_PREFIX: &str = "[image: ";
 
 impl Span {
     pub fn plain(text: impl Into<String>) -> Self {
@@ -30,28 +28,22 @@ impl Span {
     }
 
     /// The text shown for an image that can't be embedded: `[image: alt]`.
-    pub fn image_fallback(alt: &str, image: ImageRef) -> Self {
+    pub fn image_fallback(image: Image) -> Self {
         Span {
-            text: format!("{IMAGE_FALLBACK_PREFIX}{alt}]"),
+            text: format!("[image: {}]", image.alt),
             image: Some(image),
             ..Default::default()
         }
     }
-
-    /// The alt text of an [`Span::image_fallback`] span.
-    pub fn alt_text(&self) -> String {
-        self.text
-            .strip_prefix(IMAGE_FALLBACK_PREFIX)
-            .and_then(|t| t.strip_suffix(']'))
-            .unwrap_or(&self.text)
-            .to_string()
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct ImageRef {
+pub struct Image {
     pub src: String,
+    pub alt: String,
     pub title: String,
+    /// Target when the image is wrapped in a link (`[![a](x.png)](url)`).
+    pub link: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,11 +83,7 @@ pub enum Block {
     },
     ThematicBreak,
     /// An image that stood alone in its paragraph.
-    Image {
-        src: String,
-        alt: String,
-        title: String,
-    },
+    Image(Image),
 }
 
 #[derive(Debug, Clone, PartialEq)]

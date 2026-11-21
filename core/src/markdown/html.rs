@@ -6,9 +6,12 @@
 use super::frame::Frame;
 use super::stack::push_text;
 
+/// Exactly one comment: anything after its first `-->` is other content.
 pub(super) fn is_html_comment(html: &str) -> bool {
-    let html = html.trim();
-    html.starts_with("<!--") && html.ends_with("-->")
+    html.trim()
+        .strip_prefix("<!--")
+        .and_then(|rest| rest.split_once("-->"))
+        .is_some_and(|(_, after)| after.is_empty())
 }
 
 fn is_br_tag(html: &str) -> bool {

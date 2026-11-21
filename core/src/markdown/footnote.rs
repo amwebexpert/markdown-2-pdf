@@ -51,16 +51,25 @@ impl Footnotes {
         if self.definitions.is_empty() {
             return Vec::new();
         }
-        let rank = |label: &str| {
-            self.referenced
-                .iter()
-                .position(|l| l == label)
-                .unwrap_or(usize::MAX)
-        };
+        // A reference points at the first definition of its label; later
+        // duplicates are kept but ranked with the unreferenced ones.
+        let mut seen: Vec<String> = Vec::new();
+        let mut ranked: Vec<(usize, Vec<Block>)> = Vec::new();
+        for (label, blocks) in std::mem::take(&mut self.definitions) {
+            let rank = if seen.contains(&label) {
+                usize::MAX
+            } else {
+                self.referenced
+                    .iter()
+                    .position(|l| *l == label)
+                    .unwrap_or(usize::MAX)
+            };
+            seen.push(label);
+            ranked.push((rank, blocks));
+        }
         // Stable sort: unreferenced (MAX) keep their source order.
-        let mut definitions = std::mem::take(&mut self.definitions);
-        definitions.sort_by_key(|(label, _)| rank(label));
-        let items = definitions
+        ranked.sort_by_key(|(rank, _)| *rank);
+        let items = ranked
             .into_iter()
             .map(|(_, blocks)| ListItem { task: None, blocks })
             .collect();

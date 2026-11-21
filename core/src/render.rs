@@ -15,8 +15,8 @@ use std::collections::BTreeMap;
 
 use crate::error::Md2PdfError;
 use crate::fonts::{FontSet, text_width_pt};
-use crate::image::{self, Image};
-use crate::ir::{Align, Block, ImageRef, ListItem, Span};
+use crate::image::{self, Decoded};
+use crate::ir::{Align, Block, Image as ImageBlock, ListItem, Span};
 
 const PAGE_WIDTH_PT: f32 = 612.0; // US Letter, 8.5in
 const PAGE_HEIGHT_PT: f32 = 792.0; // 11in
@@ -45,8 +45,14 @@ const BASELINE_RATIO: f32 = 0.82;
 /// font size (roughly the x-height middle of Liberation Sans).
 const STRIKE_RISE: f32 = 0.3;
 const STRIKE_THICKNESS: f32 = 0.06;
-/// Task checkbox side, as a fraction of the body font size.
+/// Task checkbox: side and drop below the baseline as fractions of the body
+/// font size, stroke widths in pt, and the check mark's polyline as fractions
+/// of the box side (from its bottom-left corner).
 const CHECKBOX_SIZE: f32 = 0.7;
+const CHECKBOX_DROP: f32 = 0.05;
+const CHECKBOX_STROKE: f32 = 0.7;
+const CHECK_MARK_STROKE: f32 = 1.1;
+const CHECK_MARK: [(f32, f32); 3] = [(0.2, 0.5), (0.42, 0.22), (0.82, 0.8)];
 /// Superscript (footnote marks): font size scale and baseline rise, as
 /// fractions of the surrounding text size.
 const SUPERSCRIPT_SCALE: f32 = 0.7;
@@ -551,6 +557,10 @@ impl<'a> Renderer<'a> {
             Pt(width),
             Pt(size * 1.05),
         );
+        self.add_link(rect, url);
+    }
+
+    fn add_link(&mut self, rect: Rect, url: String) {
         self.ops.push(Op::LinkAnnotation {
             link: LinkAnnotation::new(
                 rect,
@@ -562,10 +572,18 @@ impl<'a> Renderer<'a> {
         });
     }
 
-    fn draw_strike(&mut self, x_from: f32, x_to: f32, baseline_y: f32, size: f32) {
+    /// Strike line in the struck text's color (`color`).
+    fn draw_strike(
+        &mut self,
+        x_from: f32,
+        x_to: f32,
+        baseline_y: f32,
+        size: f32,
+        color: (f32, f32, f32),
+    ) {
         let y = baseline_y + size * STRIKE_RISE;
         self.ops.push(Op::SaveGraphicsState);
-        self.ops.push(Op::SetOutlineColor { col: rgb(BLACK) });
+        self.ops.push(Op::SetOutlineColor { col: rgb(color) });
         self.ops.push(Op::SetOutlineThickness {
             pt: Pt(size * STRIKE_THICKNESS),
         });
@@ -578,9 +596,10 @@ impl<'a> Renderer<'a> {
     fn render_line(&mut self, line: &[Word], x0: f32, y: f32, size: f32) {
         let space_width = text_width_pt(&self.fonts.sans_regular, " ", size);
         let mut x = x0;
-        // Start x of the strike line being extended, if any: consecutive
-        // struck fragments (and the spaces between them) share one line.
-        let mut strike_from: Option<f32> = None;
+        // Start x and color of the strike line being extended, if any:
+        // consecutive struck fragments of one color (and the spaces between
+        // them) share one line.
+        let mut strike: Option<(f32, (f32, f32, f32))> = None;
         for (i, word) in line.iter().enumerate() {
             for fragment in &word.fragments {
                 let color = if fragment.link.is_some() {
@@ -600,23 +619,24 @@ impl<'a> Renderer<'a> {
                 if let Some(url) = fragment.link.clone() {
                     self.add_link_annotation(x, y, fragment.width, size, url);
                 }
-                match (fragment.strike, strike_from) {
-                    (true, None) => strike_from = Some(x),
-                    (false, Some(from)) => {
-                        self.draw_strike(from, x, y, size);
-                        strike_from = None;
-                    }
-                    _ => {}
+                if let Some((from, strike_color)) = strike
+                    && (!fragment.strike || strike_color != color)
+                {
+                    self.draw_strike(from, x, y, size, strike_color);
+                    strike = None;
+                }
+                if fragment.strike && strike.is_none() {
+                    strike = Some((x, color));
                 }
                 x += fragment.width;
             }
             let strike_continues =
                 word.ends_struck() && line.get(i + 1).is_some_and(Word::starts_struck);
-            if let Some(from) = strike_from
+            if let Some((from, strike_color)) = strike
                 && !strike_continues
             {
-                self.draw_strike(from, x, y, size);
-                strike_from = None;
+                self.draw_strike(from, x, y, size, strike_color);
+                strike = None;
             }
             x += space_width;
         }
@@ -648,7 +668,7 @@ impl<'a> Renderer<'a> {
                 rows,
             } => self.render_table(alignments, header, rows, x0),
             Block::ThematicBreak => self.render_rule(x0, max_width),
-            Block::Image { src, alt, title } => self.render_image(src, alt, title, x0, max_width),
+            Block::Image(image) => self.render_image(image, x0, max_width),
         }
     }
 
@@ -671,7 +691,10 @@ impl<'a> Renderer<'a> {
     fn render_image_fallback(&mut self, alt: &str, x0: f32, max_width: f32) {
         let span = Span {
             italic: true,
-            ..Span::image_fallback(alt, ImageRef::default())
+            ..Span::image_fallback(ImageBlock {
+                alt: alt.to_string(),
+                ..ImageBlock::default()
+            })
         };
         self.render_paragraph(&[span], x0, max_width);
     }
@@ -741,10 +764,12 @@ impl<'a> Renderer<'a> {
     /// having a ballot-box glyph. Sits on the baseline like a lowercase letter.
     fn draw_checkbox(&mut self, x: f32, baseline_y: f32, checked: bool) {
         let side = BODY_SIZE * CHECKBOX_SIZE;
-        let bottom = baseline_y - BODY_SIZE * 0.05;
+        let bottom = baseline_y - BODY_SIZE * CHECKBOX_DROP;
         self.ops.push(Op::SaveGraphicsState);
         self.ops.push(Op::SetOutlineColor { col: rgb(BLACK) });
-        self.ops.push(Op::SetOutlineThickness { pt: Pt(0.7) });
+        self.ops.push(Op::SetOutlineThickness {
+            pt: Pt(CHECKBOX_STROKE),
+        });
         self.ops.push(Op::DrawRectangle {
             rectangle: Rect {
                 x: Pt(x),
@@ -763,10 +788,12 @@ impl<'a> Renderer<'a> {
                 },
                 bezier: false,
             };
-            self.ops.push(Op::SetOutlineThickness { pt: Pt(1.1) });
+            self.ops.push(Op::SetOutlineThickness {
+                pt: Pt(CHECK_MARK_STROKE),
+            });
             self.ops.push(Op::DrawLine {
                 line: Line {
-                    points: vec![point(0.2, 0.5), point(0.42, 0.22), point(0.82, 0.8)],
+                    points: CHECK_MARK.iter().map(|&(fx, fy)| point(fx, fy)).collect(),
                     is_closed: false,
                 },
             });
@@ -1007,8 +1034,8 @@ impl<'a> Renderer<'a> {
             Ok(decoded) => {
                 let (width, height) = decoded.size_px();
                 let id = match decoded {
-                    Image::Raw(raw) => self.doc.add_image(&raw),
-                    Image::Jpeg(jpeg) => self.doc.add_xobject(&jpeg),
+                    Decoded::Raw(raw) => self.doc.add_image(&raw),
+                    Decoded::Jpeg(jpeg) => self.doc.add_xobject(&jpeg),
                 };
                 Some(Placed {
                     id,
@@ -1025,11 +1052,12 @@ impl<'a> Renderer<'a> {
         placed
     }
 
-    fn render_image(&mut self, src: &str, alt: &str, title: &str, x0: f32, max_width: f32) {
-        let Some(placed) = self.place_image(src) else {
-            self.render_image_fallback(alt, x0, max_width);
+    fn render_image(&mut self, image: &ImageBlock, x0: f32, max_width: f32) {
+        let Some(placed) = self.place_image(&image.src) else {
+            self.render_image_fallback(&image.alt, x0, max_width);
             return;
         };
+        let title = image.title.as_str();
         let caption = if title.is_empty() {
             Vec::new()
         } else {
@@ -1045,24 +1073,29 @@ impl<'a> Renderer<'a> {
                 &self.fonts.sans_italic,
             )
         };
-        let caption_height = caption.len() as f32 * CAPTION_LEADING;
+        let caption_height = if caption.is_empty() {
+            0.0
+        } else {
+            CAPTION_GAP + caption.len() as f32 * CAPTION_LEADING
+        };
         let printable_height = PAGE_HEIGHT_PT - 2.0 * MARGIN_PT;
         // Never upscale; keep the caption on the image's page.
-        let scale = (PT_PER_PX)
+        let scale = PT_PER_PX
             .min(max_width / placed.width_px)
             .min(((printable_height - caption_height) / placed.height_px).max(0.0));
-        let height = placed.height_px * scale;
+        let (width, height) = (placed.width_px * scale, placed.height_px * scale);
         if self.cursor_top > MARGIN_PT
             && self.cursor_top + height + caption_height > PAGE_HEIGHT_PT - MARGIN_PT
         {
             self.new_page();
         }
         self.cursor_top += height;
+        let bottom = PAGE_HEIGHT_PT - self.cursor_top;
         self.ops.push(Op::UseXobject {
             id: placed.id,
             transform: XObjectTransform {
                 translate_x: Some(Pt(x0)),
-                translate_y: Some(Pt(PAGE_HEIGHT_PT - self.cursor_top)),
+                translate_y: Some(Pt(bottom)),
                 scale_x: Some(scale),
                 scale_y: Some(scale),
                 // 1 px = 1 pt before scaling.
@@ -1070,7 +1103,15 @@ impl<'a> Renderer<'a> {
                 ..Default::default()
             },
         });
-        self.cursor_top += CAPTION_GAP;
+        if let Some(url) = image.link.clone() {
+            self.add_link(
+                Rect::from_xywh(Pt(x0), Pt(bottom), Pt(width), Pt(height)),
+                url,
+            );
+        }
+        if !caption.is_empty() {
+            self.cursor_top += CAPTION_GAP;
+        }
         for line in &caption {
             let y = self.next_baseline(CAPTION_LEADING);
             self.render_line(line, x0, y, CAPTION_SIZE);
@@ -1427,11 +1468,70 @@ mod tests {
     }
 
     fn image(src: &str, title: &str) -> Block {
-        Block::Image {
+        Block::Image(ImageBlock {
             src: src.into(),
             alt: "the alt".into(),
             title: title.into(),
-        }
+            link: None,
+        })
+    }
+
+    fn link_rects(ops: &[Op]) -> Vec<(Rect, String)> {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::LinkAnnotation { link } => match &link.actions {
+                    Actions::Uri(uri) => Some((link.rect.clone(), uri.clone())),
+                    Actions::Goto(_) => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn linked_image_gets_a_link_annotation_over_it() {
+        let images = Images::from([("a.png".to_string(), png_bytes(200, 100))]);
+        let block = Block::Image(ImageBlock {
+            link: Some("http://l".into()),
+            ..match image("a.png", "") {
+                Block::Image(i) => i,
+                _ => unreachable!(),
+            }
+        });
+        let ops = render_with(&[block], &images).ops();
+        let (x, y, _, _) = placements(&ops)[0];
+        let links = link_rects(&ops);
+        assert_eq!(links.len(), 1);
+        let (rect, uri) = &links[0];
+        assert_eq!(uri, "http://l");
+        assert!((rect.x.0 - x).abs() < 0.01 && (rect.y.0 - y).abs() < 0.01);
+        assert!((rect.width.0 - 150.0).abs() < 0.01 && (rect.height.0 - 75.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn full_page_image_with_caption_stays_inside_the_margins() {
+        let images = Images::from([("t.png".to_string(), png_bytes(100, 3000))]);
+        let ops = render_with(&[image("t.png", "Caption")], &images).ops();
+        let caption_baseline = text_runs(&ops)[0].2;
+        assert!(caption_baseline >= MARGIN_PT, "{caption_baseline}");
+    }
+
+    #[test]
+    fn strike_through_a_link_uses_the_link_color() {
+        let ops = rendered_ops(&[paragraph(vec![Span {
+            text: "gone".into(),
+            strike: true,
+            link: Some("u".into()),
+            ..Default::default()
+        }])]);
+        let strike_color = ops
+            .iter()
+            .find_map(|op| match op {
+                Op::SetOutlineColor { col } => Some(col.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(strike_color, rgb(LINK_COLOR));
     }
 
     /// `(x, y, scale_x, scale_y)` of every placed `XObject`.

@@ -41,6 +41,28 @@ fn has_url_scheme(src: &str) -> bool {
     })
 }
 
+/// Decodes `%XX` escapes (`my%20file.png` → `my file.png`), as a Markdown
+/// link destination with spaces must be written. Invalid escapes stay as is.
+fn percent_decode(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        let hex = bytes
+            .get(i + 1..i + 3)
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        if let (b'%', Some(decoded)) = (b, hex) {
+            out.push(decoded);
+            i += 3;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| src.to_string())
+}
+
 /// Reads the images the document embeds. Relative paths resolve against
 /// `base_dir` (the Markdown file's directory); URLs are never fetched.
 /// Problems become warnings: the image then renders as `[image: alt]`.
@@ -52,7 +74,7 @@ fn load_images(markdown: &str, base_dir: &Path) -> (BTreeMap<String, Vec<u8>>, V
             warnings.push(format!("image {src}: remote images are not fetched"));
             continue;
         }
-        let path = base_dir.join(&src);
+        let path = base_dir.join(percent_decode(&src));
         match std::fs::read(&path) {
             Ok(bytes) => {
                 images.insert(src, bytes);
@@ -206,6 +228,14 @@ mod tests {
             "image https://example.com/d.png: remote images are not fetched"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn percent_escapes_are_decoded_for_file_lookup() {
+        assert_eq!(percent_decode("my%20file.png"), "my file.png");
+        assert_eq!(percent_decode("caf%C3%A9.png"), "café.png");
+        assert_eq!(percent_decode("100%.png"), "100%.png");
+        assert_eq!(percent_decode("a%2.png"), "a%2.png");
     }
 
     #[test]

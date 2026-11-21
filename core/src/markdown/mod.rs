@@ -1,10 +1,10 @@
 //! Parses Markdown into the [`crate::ir`] block tree using pulldown-cmark.
 //!
-//! Only `Options::ENABLE_TABLES` is turned on. Everything else CommonMark can
-//! emit without an extension flag (blockquotes, images, thematic breaks, raw
-//! HTML) is handled below; anything gated behind an extension we don't enable
-//! (strikethrough, task lists, footnotes, ...) simply falls through pulldown-cmark
-//! as literal text, which is itself the "best-effort, never fail" fallback.
+//! GFM tables, strikethrough, task lists and footnotes are enabled on top of
+//! CommonMark (blockquotes, images, thematic breaks, raw HTML). Anything gated
+//! behind an extension we don't enable (math, definition lists, super/subscript,
+//! wiki links) simply falls through pulldown-cmark as literal text, which is
+//! itself the "best-effort, never fail" fallback.
 
 mod align;
 mod close;
@@ -62,7 +62,7 @@ pub fn image_sources(blocks: &[Block]) -> Vec<String> {
     fn walk(blocks: &[Block], out: &mut Vec<String>) {
         for block in blocks {
             match block {
-                Block::Image { src, .. } if !out.contains(src) => out.push(src.clone()),
+                Block::Image(image) if !out.contains(&image.src) => out.push(image.src.clone()),
                 Block::BlockQuote(inner) => walk(inner, out),
                 Block::List { items, .. } => {
                     for item in items {
@@ -81,7 +81,7 @@ pub fn image_sources(blocks: &[Block]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{image_sources, parse};
-    use crate::ir::{Align, Block, Span};
+    use crate::ir::{Align, Block, Image, Span};
 
     fn span_text(spans: &[Span]) -> String {
         spans.iter().map(|s| s.text.as_str()).collect()
@@ -153,11 +153,12 @@ mod tests {
         let blocks = parse("![alt text](img/x.png \"The title\")");
         assert_eq!(
             blocks,
-            vec![Block::Image {
+            vec![Block::Image(Image {
                 src: "img/x.png".into(),
                 alt: "alt text".into(),
                 title: "The title".into(),
-            }]
+                link: None,
+            })]
         );
     }
 
@@ -167,7 +168,7 @@ mod tests {
         let srcs: Vec<&str> = blocks
             .iter()
             .map(|b| match b {
-                Block::Image { src, .. } => src.as_str(),
+                Block::Image(image) => image.src.as_str(),
                 other => panic!("expected images, got {other:?}"),
             })
             .collect();
@@ -190,7 +191,7 @@ mod tests {
         let blocks = parse("- ![a](a.png)\n");
         match blocks.as_slice() {
             [Block::List { items, .. }] => {
-                assert!(matches!(items[0].blocks.as_slice(), [Block::Image { .. }]));
+                assert!(matches!(items[0].blocks.as_slice(), [Block::Image(_)]));
             }
             other => panic!("expected one list, got {other:?}"),
         }
@@ -490,7 +491,7 @@ mod tests {
     fn image_alt_includes_inline_code_text() {
         let blocks = parse("![a `b` c](x.png)");
         match blocks.as_slice() {
-            [Block::Image { alt, .. }] => assert_eq!(alt, "a b c"),
+            [Block::Image(image)] => assert_eq!(image.alt, "a b c"),
             other => panic!("expected one paragraph, got {other:?}"),
         }
     }
@@ -523,6 +524,60 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, ["before", "after"]);
+    }
+
+    #[test]
+    fn html_block_mixing_comments_and_content_is_kept() {
+        let blocks = parse("<!-- a --> <div>secret</div> <!-- b -->\n");
+        match blocks.as_slice() {
+            [Block::CodeBlock { text }] => assert!(text.contains("secret"), "{text}"),
+            other => panic!("expected the html shown verbatim, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_footnote_definitions_do_not_shift_numbers() {
+        let blocks = parse("a[^n] b[^m]\n\n[^n]: one\n\n[^n]: dup\n\n[^m]: two\n");
+        assert_eq!(endnotes(&blocks), ["one", "two", "dup"]);
+    }
+
+    #[test]
+    fn ordered_task_items_keep_their_number_and_state() {
+        let blocks = parse("1. [x] done\n2. [ ] todo\n");
+        match blocks.as_slice() {
+            [
+                Block::List {
+                    ordered: true,
+                    items,
+                    ..
+                },
+            ] => {
+                let texts: Vec<String> = items
+                    .iter()
+                    .map(|i| {
+                        assert_eq!(i.task, None);
+                        match i.blocks.as_slice() {
+                            [Block::Paragraph { spans }] => span_text(spans),
+                            other => panic!("expected one paragraph, got {other:?}"),
+                        }
+                    })
+                    .collect();
+                assert_eq!(texts, ["[x] done", "[ ] todo"]);
+            }
+            other => panic!("expected one ordered list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn linked_image_keeps_its_link() {
+        let blocks = parse("[![a](x.png)](http://l)");
+        match blocks.as_slice() {
+            [Block::Image(image)] => {
+                assert_eq!(image.src, "x.png");
+                assert_eq!(image.link.as_deref(), Some("http://l"));
+            }
+            other => panic!("expected one image, got {other:?}"),
+        }
     }
 
     #[test]

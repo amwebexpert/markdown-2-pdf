@@ -11,16 +11,16 @@ use printpdf::{
 
 /// A decoded image ready to be added to the PDF document.
 #[derive(Debug)]
-pub enum Image {
+pub enum Decoded {
     Raw(RawImage),
     Jpeg(ExternalXObject),
 }
 
-impl Image {
+impl Decoded {
     pub fn size_px(&self) -> (usize, usize) {
         match self {
-            Image::Raw(raw) => (raw.width, raw.height),
-            Image::Jpeg(x) => (x.width.map_or(0, |w| w.0), x.height.map_or(0, |h| h.0)),
+            Decoded::Raw(raw) => (raw.width, raw.height),
+            Decoded::Jpeg(x) => (x.width.map_or(0, |w| w.0), x.height.map_or(0, |h| h.0)),
         }
     }
 }
@@ -35,11 +35,11 @@ const MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
 ///
 /// A human-readable reason when the format is unsupported or the data is
 /// corrupt; the caller turns it into a warning and a text fallback.
-pub fn decode(bytes: &[u8]) -> Result<Image, String> {
+pub fn decode(bytes: &[u8]) -> Result<Decoded, String> {
     if bytes.starts_with(PNG_SIGNATURE) {
-        decode_png(bytes).map(Image::Raw)
+        decode_png(bytes).map(Decoded::Raw)
     } else if bytes.starts_with(&[0xFF, 0xD8]) {
-        jpeg_xobject(bytes).map(Image::Jpeg)
+        jpeg_xobject(bytes).map(Decoded::Jpeg)
     } else {
         Err("unsupported image format (only PNG and JPEG are embedded)".to_string())
     }
@@ -78,8 +78,8 @@ fn decode_png(bytes: &[u8]) -> Result<RawImage, String> {
     })
 }
 
-/// Frame header of a JPEG: `(width, height, components)`.
-fn jpeg_frame(bytes: &[u8]) -> Option<(u16, u16, u8)> {
+/// Frame header of a JPEG: `(precision, width, height, components)`.
+fn jpeg_frame(bytes: &[u8]) -> Option<(u8, u16, u16, u8)> {
     let mut i = 2;
     loop {
         // Markers may be padded with extra 0xFF bytes.
@@ -93,10 +93,11 @@ fn jpeg_frame(bytes: &[u8]) -> Option<(u16, u16, u8)> {
         let len = usize::from(u16::from_be_bytes([*bytes.get(i + 2)?, *bytes.get(i + 3)?]));
         // SOF0..SOF15 except DHT (C4), JPG (C8) and DAC (CC).
         if (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+            let precision = *bytes.get(i + 4)?;
             let height = u16::from_be_bytes([*bytes.get(i + 5)?, *bytes.get(i + 6)?]);
             let width = u16::from_be_bytes([*bytes.get(i + 7)?, *bytes.get(i + 8)?]);
             let components = *bytes.get(i + 9)?;
-            return Some((width, height, components));
+            return Some((precision, width, height, components));
         }
         if marker == 0xDA || len < 2 {
             return None; // start of scan without a frame header
@@ -106,10 +107,13 @@ fn jpeg_frame(bytes: &[u8]) -> Option<(u16, u16, u8)> {
 }
 
 fn jpeg_xobject(bytes: &[u8]) -> Result<ExternalXObject, String> {
-    let (width, height, components) =
+    let (precision, width, height, components) =
         jpeg_frame(bytes).ok_or_else(|| "invalid JPEG: no frame header".to_string())?;
     if width == 0 || height == 0 {
         return Err("invalid JPEG: empty frame".to_string());
+    }
+    if precision != 8 {
+        return Err(format!("unsupported {precision}-bit JPEG"));
     }
     let color_space = match components {
         1 => "DeviceGray",
@@ -163,10 +167,10 @@ mod tests {
         out
     }
 
-    fn raw(image: Image) -> RawImage {
+    fn raw(image: Decoded) -> RawImage {
         match image {
-            Image::Raw(raw) => raw,
-            Image::Jpeg(_) => panic!("expected a raw image"),
+            Decoded::Raw(raw) => raw,
+            Decoded::Jpeg(_) => panic!("expected a raw image"),
         }
     }
 
@@ -252,7 +256,7 @@ mod tests {
     fn jpeg_is_passed_through_with_its_frame_size() {
         let bytes = jpeg(640, 480, 3);
         match decode(&bytes).unwrap() {
-            Image::Jpeg(x) => {
+            Decoded::Jpeg(x) => {
                 assert_eq!((x.width, x.height), (Some(Px(640)), Some(Px(480))));
                 assert_eq!(x.stream.content, bytes);
                 assert_eq!(
@@ -264,8 +268,15 @@ mod tests {
                     Some(&DictItem::Name(b"DeviceRGB".to_vec()))
                 );
             }
-            Image::Raw(_) => panic!("expected a JPEG passthrough"),
+            Decoded::Raw(_) => panic!("expected a JPEG passthrough"),
         }
+    }
+
+    #[test]
+    fn jpeg_with_12_bit_samples_is_rejected() {
+        let mut bytes = jpeg(10, 10, 3);
+        bytes[12] = 12; // frame header precision
+        assert!(decode(&bytes).unwrap_err().contains("12-bit"));
     }
 
     #[test]

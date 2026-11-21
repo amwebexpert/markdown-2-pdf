@@ -1,6 +1,6 @@
 //! Stack mutations shared by event handling (text, blocks, implicit paragraphs).
 
-use crate::ir::{Block, ImageRef, Span};
+use crate::ir::{Block, Image, Span};
 
 use super::frame::Frame;
 
@@ -25,9 +25,14 @@ pub(super) fn push_paragraph(stack: &mut [Frame], spans: Vec<Span>) {
         return;
     }
     for span in spans {
-        let alt = span.alt_text();
-        if let Some(ImageRef { src, title }) = span.image {
-            push_block(stack, Block::Image { src, alt, title });
+        if let Some(image) = span.image {
+            push_block(
+                stack,
+                Block::Image(Image {
+                    link: span.link,
+                    ..image
+                }),
+            );
         }
     }
 }

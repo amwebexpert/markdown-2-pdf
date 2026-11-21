@@ -2,7 +2,7 @@
 
 use pulldown_cmark::{HeadingLevel, TagEnd};
 
-use crate::ir::{Block, ImageRef, ListItem, Span};
+use crate::ir::{Block, Image, ListItem, Span};
 
 use super::align::heading_level;
 use super::frame::Frame;
@@ -82,15 +82,24 @@ fn close_list(stack: &mut Vec<Frame>) {
 fn close_item(stack: &mut Vec<Frame>) {
     if let Some(Frame::Container(blocks)) = stack.pop()
         && let Some(Frame::List {
+            ordered,
             items,
             pending_task,
             ..
         }) = stack.last_mut()
     {
-        items.push(ListItem {
-            task: pending_task.take(),
-            blocks,
-        });
+        let mut blocks = blocks;
+        let mut task = pending_task.take();
+        // The checkbox takes the marker slot, so an ordered item would lose its
+        // number: keep the number and show the state as `[x] ` text instead.
+        if *ordered
+            && let Some(checked) = task.take()
+            && let Some(Block::Paragraph { spans }) = blocks.first_mut()
+        {
+            let mark = if checked { "[x] " } else { "[ ] " };
+            spans.insert(0, Span::plain(mark));
+        }
+        items.push(ListItem { task, blocks });
     }
 }
 
@@ -160,7 +169,15 @@ fn close_link(stack: &mut Vec<Frame>) {
 
 fn close_image(stack: &mut Vec<Frame>) {
     if let Some(Frame::Image { src, title, alt }) = stack.pop() {
-        push_span(stack, Span::image_fallback(&alt, ImageRef { src, title }));
+        push_span(
+            stack,
+            Span::image_fallback(Image {
+                src,
+                alt,
+                title,
+                link: None,
+            }),
+        );
     }
 }
 
