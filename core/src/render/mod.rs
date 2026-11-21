@@ -39,6 +39,11 @@ const HEADING_SPACING_AFTER: f32 = 6.0;
 /// Room a heading reserves for its section's start: two body lines.
 const HEADING_KEEP_WITH_NEXT: f32 = 2.0 * BODY_LEADING;
 const CODE_SPACING_BEFORE: f32 = 4.0;
+const CODE_PADDING: f32 = 4.0;
+const CODE_BACKGROUND: (f32, f32, f32) = (0.96, 0.96, 0.96);
+/// Blockquote side bar: x offset inside the quote indent, and stroke width.
+const BLOCKQUOTE_BAR_INSET: f32 = 6.0;
+const BLOCKQUOTE_BAR_WIDTH: f32 = 2.0;
 const LIST_INDENT: f32 = 18.0;
 const BLOCKQUOTE_INDENT: f32 = 18.0;
 const TABLE_FONT_SIZE: f32 = 10.0;
@@ -469,6 +474,13 @@ struct TableFrame<'t> {
     repeat_header: bool,
 }
 
+/// Where a block started: page, op count and cursor — see `Renderer::decorate`.
+struct Mark {
+    page: usize,
+    op_index: usize,
+    top: f32,
+}
+
 struct FontIds {
     sans_regular: FontId,
     sans_bold: FontId,
@@ -501,6 +513,11 @@ struct Renderer<'a> {
     fonts: FontSet,
     font_ids: FontIds,
     pages: Vec<PdfPage>,
+    /// Where each finished page's content ended (see `content_bottom`).
+    page_ends: Vec<f32>,
+    /// Bottom of the last thing drawn on the current page, excluding the
+    /// spacing after it: where a decoration of the block above should end.
+    content_bottom: f32,
     ops: Vec<Op>,
     /// Distance from the top of the page to the next free line box.
     cursor_top: f32,
@@ -528,6 +545,8 @@ impl<'a> Renderer<'a> {
             fonts,
             font_ids,
             pages: Vec::new(),
+            page_ends: Vec::new(),
+            content_bottom: MARGIN_PT,
             ops: Vec::new(),
             cursor_top: MARGIN_PT,
         })
@@ -547,6 +566,8 @@ impl<'a> Renderer<'a> {
     }
 
     fn new_page(&mut self) {
+        self.page_ends.push(self.content_bottom);
+        self.content_bottom = MARGIN_PT;
         let ops = std::mem::take(&mut self.ops);
         self.pages.push(PdfPage::new(
             Mm::from(Pt(PAGE_WIDTH_PT)),
@@ -567,6 +588,7 @@ impl<'a> Renderer<'a> {
     fn next_baseline(&mut self, leading: f32) -> f32 {
         let baseline_from_top = self.cursor_top + leading * BASELINE_RATIO;
         self.cursor_top += leading;
+        self.content_bottom = self.cursor_top;
         PAGE_HEIGHT_PT - baseline_from_top
     }
 
@@ -787,32 +809,124 @@ impl<'a> Renderer<'a> {
         self.cursor_top += PARAGRAPH_SPACING_AFTER;
     }
 
+    fn mark(&self) -> Mark {
+        Mark {
+            page: self.pages.len(),
+            op_index: self.ops.len(),
+            top: self.cursor_top,
+        }
+    }
+
+    /// Decorates the content drawn since `mark`, once per page it spans:
+    /// `draw(top, bottom)` gets the fragment's extent (PDF y, top > bottom) and
+    /// returns ops inserted before that fragment's content, so they sit
+    /// beneath it. Pages where the block drew nothing are skipped.
+    fn decorate(&mut self, mark: &Mark, draw: impl Fn(f32, f32) -> Vec<Op>) {
+        for page in mark.page..=self.pages.len() {
+            let top = if page == mark.page {
+                mark.top
+            } else {
+                MARGIN_PT
+            };
+            let bottom = self
+                .page_ends
+                .get(page)
+                .copied()
+                .unwrap_or(self.content_bottom);
+            if bottom <= top {
+                continue;
+            }
+            let at = if page == mark.page { mark.op_index } else { 0 };
+            let ops = draw(PAGE_HEIGHT_PT - top, PAGE_HEIGHT_PT - bottom);
+            let target = match self.pages.get_mut(page) {
+                Some(finished) => &mut finished.ops,
+                None => &mut self.ops,
+            };
+            let at = at.min(target.len());
+            target.splice(at..at, ops);
+        }
+    }
+
     fn render_blockquote(&mut self, blocks: &[Block], x0: f32) {
         let quote_x = x0 + BLOCKQUOTE_INDENT;
+        let mark = self.mark();
         for block in blocks {
             self.render_block(block, quote_x);
         }
+        let bar_x = x0 + BLOCKQUOTE_BAR_INSET;
+        self.decorate(&mark, |top, bottom| {
+            vec![
+                Op::SaveGraphicsState,
+                Op::SetOutlineColor {
+                    col: rgb(RULE_GREY),
+                },
+                Op::SetOutlineThickness {
+                    pt: Pt(BLOCKQUOTE_BAR_WIDTH),
+                },
+                Op::DrawLine {
+                    line: Line {
+                        points: [top, bottom]
+                            .map(|y| LinePoint {
+                                p: Point {
+                                    x: Pt(bar_x),
+                                    y: Pt(y),
+                                },
+                                bezier: false,
+                            })
+                            .to_vec(),
+                        is_closed: false,
+                    },
+                },
+                Op::RestoreGraphicsState,
+            ]
+        });
     }
 
     fn render_code_block(&mut self, text: &str, x0: f32, max_width: f32) {
         self.space_before(CODE_SPACING_BEFORE);
-        let mut any = false;
-        for line in text.lines() {
-            any = true;
-            for wrapped in wrap_monospace(&self.fonts, line, CODE_SIZE, max_width) {
-                self.ensure_space(CODE_LEADING);
-                let y = self.next_baseline(CODE_LEADING);
-                let style = TextStyle {
-                    code: true,
-                    ..TextStyle::regular(CODE_SIZE)
-                };
-                self.draw_text(x0, y, &wrapped, style);
-            }
+        let text_x = x0 + CODE_PADDING;
+        let wrap_width = (max_width - 2.0 * CODE_PADDING).max(1.0);
+        let mut lines: Vec<String> = text
+            .lines()
+            .flat_map(|line| wrap_monospace(&self.fonts, line, CODE_SIZE, wrap_width))
+            .collect();
+        if lines.is_empty() {
+            lines.push(String::new());
         }
-        if !any {
+        // Start where the first line will be drawn, not on a page it leaves.
+        self.ensure_space(CODE_LEADING + CODE_PADDING);
+        let mark = self.mark();
+        self.cursor_top += CODE_PADDING;
+        for line in &lines {
             self.ensure_space(CODE_LEADING);
-            self.next_baseline(CODE_LEADING);
+            let y = self.next_baseline(CODE_LEADING);
+            let style = TextStyle {
+                code: true,
+                ..TextStyle::regular(CODE_SIZE)
+            };
+            self.draw_text(text_x, y, line, style);
         }
+        self.cursor_top += CODE_PADDING;
+        self.content_bottom = self.cursor_top;
+        self.decorate(&mark, |top, bottom| {
+            vec![
+                Op::SaveGraphicsState,
+                Op::SetFillColor {
+                    col: rgb(CODE_BACKGROUND),
+                },
+                Op::DrawRectangle {
+                    rectangle: Rect {
+                        x: Pt(x0),
+                        y: Pt(bottom),
+                        width: Pt(max_width),
+                        height: Pt(top - bottom),
+                        mode: Some(PaintMode::Fill),
+                        winding_order: None,
+                    },
+                },
+                Op::RestoreGraphicsState,
+            ]
+        });
         self.cursor_top += PARAGRAPH_SPACING_AFTER;
     }
 
@@ -985,6 +1099,7 @@ impl<'a> Renderer<'a> {
         self.ops.push(Op::DrawLine {
             line: horizontal_line(x0, x0 + max_width, y),
         });
+        self.content_bottom = self.cursor_top;
         self.ops.push(Op::RestoreGraphicsState);
         self.cursor_top += BODY_LEADING * 0.5;
     }
@@ -1084,6 +1199,7 @@ impl<'a> Renderer<'a> {
         let row_height = row_height(range.len());
         let row_top = self.cursor_top;
         self.cursor_top += row_height;
+        self.content_bottom = self.cursor_top;
         let row_top_pdf_y = PAGE_HEIGHT_PT - row_top;
         let row_bottom_pdf_y = row_top_pdf_y - row_height;
         let space_width = text_width_pt(&self.fonts.sans_regular, " ", TABLE_FONT_SIZE);
@@ -1203,6 +1319,7 @@ impl<'a> Renderer<'a> {
             self.new_page();
         }
         self.cursor_top += height;
+        self.content_bottom = self.cursor_top;
         let bottom = PAGE_HEIGHT_PT - self.cursor_top;
         self.ops.push(Op::UseXobject {
             id: placed.id,
@@ -1965,6 +2082,122 @@ mod tests {
         renderer.new_page();
         let (_, page_count, _) = renderer.finish();
         assert_eq!(page_count, 1);
+    }
+
+    fn filled_rects(ops: &[Op]) -> Vec<Rect> {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::DrawRectangle { rectangle } if rectangle.mode == Some(PaintMode::Fill) => {
+                    Some(rectangle.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn contains(rect: &Rect, x: f32, y: f32) -> bool {
+        x >= rect.x.0
+            && x <= rect.x.0 + rect.width.0
+            && y >= rect.y.0
+            && y <= rect.y.0 + rect.height.0
+    }
+
+    fn code(lines: usize) -> Block {
+        Block::CodeBlock {
+            text: (1..=lines)
+                .map(|i| format!("code{i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+
+    #[test]
+    fn code_block_sits_on_a_background_behind_its_text() {
+        let ops = rendered_ops(&[code(3)]);
+        let backgrounds = filled_rects(&ops);
+        assert_eq!(backgrounds.len(), 1);
+        let first_text = ops
+            .iter()
+            .position(|op| matches!(op, Op::ShowText { .. }))
+            .unwrap();
+        let background = ops
+            .iter()
+            .position(|op| matches!(op, Op::DrawRectangle { .. }))
+            .unwrap();
+        assert!(background < first_text, "background drawn first");
+        for (_, x, y) in text_runs(&ops) {
+            assert!(contains(&backgrounds[0], x, y), "text at {x},{y} outside");
+        }
+    }
+
+    #[test]
+    fn code_block_across_pages_gets_one_background_per_page() {
+        let rendered = render_with(&[code(80)], &Images::new());
+        assert_eq!(rendered.pages.len(), 2);
+        for ops in &rendered.pages {
+            let backgrounds = filled_rects(ops);
+            assert_eq!(backgrounds.len(), 1);
+            let bg = &backgrounds[0];
+            assert!(
+                bg.y.0 >= MARGIN_PT - 0.01
+                    && bg.y.0 + bg.height.0 <= PAGE_HEIGHT_PT - MARGIN_PT + 0.01
+            );
+            for (_, x, y) in text_runs(ops) {
+                assert!(contains(bg, x, y));
+            }
+        }
+    }
+
+    #[test]
+    fn code_block_pushed_to_the_next_page_leaves_no_background_behind() {
+        let mut blocks = filler(29);
+        blocks.push(code(2));
+        let rendered = render_with(&blocks, &Images::new());
+        assert_eq!(rendered.pages.len(), 2);
+        assert!(filled_rects(&rendered.pages[0]).is_empty());
+        assert_eq!(filled_rects(&rendered.pages[1]).len(), 1);
+    }
+
+    #[test]
+    fn blockquote_has_a_bar_on_each_page_it_spans() {
+        let quote = Block::BlockQuote(filler(40));
+        let rendered = render_with(&[quote], &Images::new());
+        assert_eq!(rendered.pages.len(), 2);
+        for ops in &rendered.pages {
+            let bars: Vec<&Line> = lines_drawn(ops)
+                .into_iter()
+                .filter(|l| (l.points[0].p.x.0 - l.points[1].p.x.0).abs() < 0.01)
+                .collect();
+            assert_eq!(bars.len(), 1);
+            let text_x = text_runs(ops)[0].1;
+            assert!(bars[0].points[0].p.x.0 < text_x);
+            let (top, bottom) = (bars[0].points[0].p.y.0, bars[0].points[1].p.y.0);
+            for (_, _, y) in text_runs(ops) {
+                assert!(
+                    y <= top && y >= bottom,
+                    "text at {y} outside bar {bottom}..{top}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blockquote_bar_ends_at_its_last_line_whatever_the_last_block() {
+        for last in [
+            paragraph(vec![Span::plain("end")]),
+            list(vec![(None, "end")]),
+            heading(3, "end"),
+        ] {
+            let ops = rendered_ops(&[Block::BlockQuote(vec![last])]);
+            let bar = lines_drawn(&ops)[0].clone();
+            let baseline = text_runs(&ops).last().unwrap().2;
+            let bottom = bar.points[1].p.y.0;
+            assert!(bottom < baseline, "bar stops above the last baseline");
+            assert!(
+                baseline - bottom < BODY_SIZE,
+                "bar runs past the last line: {bottom} vs {baseline}"
+            );
+        }
     }
 
     #[test]
