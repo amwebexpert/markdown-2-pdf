@@ -1,4 +1,9 @@
-//! Table column sizing: a predictable, content-aware width per column.
+//! Table measurement: content-aware column widths and rows wrapped to them.
+
+use super::{
+    FontSet, MIN_COLUMN_CONTENT, Span, TABLE_CELL_PADDING, TABLE_FONT_SIZE, TABLE_ROW_LEADING,
+    Token, Word, split_oversized_words, text_width_pt, tokenize, wrap_lines,
+};
 
 /// What one column needs, both including cell padding.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -34,6 +39,91 @@ pub(super) fn column_widths(demands: &[Demand], available: f32) -> Vec<f32> {
         .iter()
         .map(|d| available * d.min / sum_min)
         .collect()
+}
+
+/// Width demand of one cell, measured with the same tokens as wrapping uses
+/// (so per-span fonts, explicit breaks and code all count).
+pub(super) fn cell_demand(fonts: &FontSet, spans: &[Span], force_bold: bool) -> Demand {
+    let space_width = text_width_pt(&fonts.sans_regular, " ", TABLE_FONT_SIZE);
+    let (mut min, mut max, mut line) = (0.0f32, 0.0f32, 0.0f32);
+    for token in tokenize(spans, fonts, TABLE_FONT_SIZE, force_bold) {
+        match token {
+            Token::Word(word) => {
+                min = min.max(word.width);
+                line += if line > 0.0 { space_width } else { 0.0 } + word.width;
+                max = max.max(line);
+            }
+            Token::Break => line = 0.0,
+        }
+    }
+    let padding = TABLE_CELL_PADDING * 2.0;
+    Demand {
+        min: min + padding,
+        max: max + padding,
+    }
+}
+
+/// Per-column demand over the header (measured bold) and every body row.
+pub(super) fn column_demands(
+    fonts: &FontSet,
+    num_cols: usize,
+    header: &[Vec<Span>],
+    rows: &[Vec<Vec<Span>>],
+) -> Vec<Demand> {
+    let floor = TABLE_CELL_PADDING * 2.0 + MIN_COLUMN_CONTENT;
+    let mut demands = vec![
+        Demand {
+            min: floor,
+            max: floor
+        };
+        num_cols
+    ];
+    let rows = std::iter::once((header, true)).chain(rows.iter().map(|r| (r.as_slice(), false)));
+    for (cells, bold) in rows {
+        for (demand, spans) in demands.iter_mut().zip(cells) {
+            let cell = cell_demand(fonts, spans, bold);
+            demand.min = demand.min.max(cell.min);
+            demand.max = demand.max.max(cell.max);
+        }
+    }
+    demands
+}
+
+/// A table row wrapped to its column widths: lines per cell.
+pub(super) struct RowLayout {
+    pub cells: Vec<Vec<Vec<Word>>>,
+    /// Line count of the tallest cell (at least 1).
+    pub lines: usize,
+}
+
+impl RowLayout {
+    /// Wraps every cell of a row within its column width — done up front
+    /// (separately from drawing) so pagination knows each row's height.
+    pub fn new(fonts: &FontSet, col_widths: &[f32], cells: &[Vec<Span>], force_bold: bool) -> Self {
+        let space_width = text_width_pt(&fonts.sans_regular, " ", TABLE_FONT_SIZE);
+        let mut wrapped = Vec::with_capacity(col_widths.len());
+        for (i, &col_width) in col_widths.iter().enumerate() {
+            let spans = cells.get(i).cloned().unwrap_or_default();
+            let content_width = (col_width - TABLE_CELL_PADDING * 2.0).max(1.0);
+            let tokens = tokenize(&spans, fonts, TABLE_FONT_SIZE, force_bold);
+            let tokens = split_oversized_words(tokens, fonts, TABLE_FONT_SIZE, content_width);
+            wrapped.push(wrap_lines(tokens, content_width, space_width));
+        }
+        let lines = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
+        RowLayout {
+            cells: wrapped,
+            lines,
+        }
+    }
+
+    pub fn height(&self) -> f32 {
+        row_height(self.lines)
+    }
+}
+
+/// Height of a row (or row part) showing `lines` lines.
+pub(super) fn row_height(lines: usize) -> f32 {
+    lines as f32 * TABLE_ROW_LEADING + TABLE_CELL_PADDING * 2.0
 }
 
 #[cfg(test)]

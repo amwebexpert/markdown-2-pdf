@@ -16,7 +16,7 @@ use std::ops::Range;
 
 mod table;
 
-use table::{Demand, column_widths};
+use table::{RowLayout, column_demands, column_widths, row_height};
 
 use crate::error::Md2PdfError;
 use crate::fonts::{FontSet, text_width_pt};
@@ -55,6 +55,9 @@ const TABLE_ROW_LEADING: f32 = 13.0;
 const TABLE_CELL_PADDING: f32 = 4.0;
 const TABLE_BORDER_THICKNESS: f32 = 0.6;
 const TABLE_SPACING_BEFORE: f32 = 4.0;
+/// A header taller than this fraction of the printable height is drawn once
+/// rather than repeated on every page.
+const MAX_REPEATED_HEADER: f32 = 0.5;
 /// Narrowest column content width, so an empty column stays visible.
 const MIN_COLUMN_CONTENT: f32 = 10.0;
 /// Baseline distance below the top of a line box, as a fraction of leading —
@@ -382,98 +385,13 @@ fn split_oversized_words(
     out
 }
 
-/// Width demand of one cell, measured with the same tokens as wrapping uses
-/// (so per-span fonts, explicit breaks and code all count).
-fn cell_demand(fonts: &FontSet, spans: &[Span], force_bold: bool) -> Demand {
-    let space_width = text_width_pt(&fonts.sans_regular, " ", TABLE_FONT_SIZE);
-    let (mut min, mut max, mut line) = (0.0f32, 0.0f32, 0.0f32);
-    for token in tokenize(spans, fonts, TABLE_FONT_SIZE, force_bold) {
-        match token {
-            Token::Word(word) => {
-                min = min.max(word.width);
-                line += if line > 0.0 { space_width } else { 0.0 } + word.width;
-                max = max.max(line);
-            }
-            Token::Break => line = 0.0,
-        }
-    }
-    let padding = TABLE_CELL_PADDING * 2.0;
-    Demand {
-        min: min + padding,
-        max: max + padding,
-    }
-}
-
-/// Per-column demand over the header (measured bold) and every body row.
-fn column_demands(
-    fonts: &FontSet,
-    num_cols: usize,
-    header: &[Vec<Span>],
-    rows: &[Vec<Vec<Span>>],
-) -> Vec<Demand> {
-    let floor = TABLE_CELL_PADDING * 2.0 + MIN_COLUMN_CONTENT;
-    let mut demands = vec![
-        Demand {
-            min: floor,
-            max: floor
-        };
-        num_cols
-    ];
-    let rows = std::iter::once((header, true)).chain(rows.iter().map(|r| (r.as_slice(), false)));
-    for (cells, bold) in rows {
-        for (demand, spans) in demands.iter_mut().zip(cells) {
-            let cell = cell_demand(fonts, spans, bold);
-            demand.min = demand.min.max(cell.min);
-            demand.max = demand.max.max(cell.max);
-        }
-    }
-    demands
-}
-
-/// A table row wrapped to its column widths: lines per cell.
-struct RowLayout {
-    cells: Vec<Vec<Vec<Word>>>,
-    /// Line count of the tallest cell (at least 1).
-    lines: usize,
-}
-
-impl RowLayout {
-    /// Wraps every cell of a row within its column width — done up front
-    /// (separately from drawing) so pagination knows each row's height.
-    fn new(fonts: &FontSet, col_widths: &[f32], cells: &[Vec<Span>], force_bold: bool) -> Self {
-        let space_width = text_width_pt(&fonts.sans_regular, " ", TABLE_FONT_SIZE);
-        let mut wrapped = Vec::with_capacity(col_widths.len());
-        for (i, &col_width) in col_widths.iter().enumerate() {
-            let spans = cells.get(i).cloned().unwrap_or_default();
-            let content_width = (col_width - TABLE_CELL_PADDING * 2.0).max(1.0);
-            let tokens = tokenize(&spans, fonts, TABLE_FONT_SIZE, force_bold);
-            let tokens = split_oversized_words(tokens, fonts, TABLE_FONT_SIZE, content_width);
-            wrapped.push(wrap_lines(tokens, content_width, space_width));
-        }
-        let lines = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
-        RowLayout {
-            cells: wrapped,
-            lines,
-        }
-    }
-
-    fn height(&self) -> f32 {
-        row_height(self.lines)
-    }
-}
-
-/// Height of a row (or row part) showing `lines` lines.
-fn row_height(lines: usize) -> f32 {
-    lines as f32 * TABLE_ROW_LEADING + TABLE_CELL_PADDING * 2.0
-}
-
 /// Shared geometry of one table being drawn.
 struct TableFrame<'t> {
     x0: f32,
     col_widths: &'t [f32],
     alignments: &'t [Align],
     header: &'t RowLayout,
-    /// False for a header too tall to repeat (over half a page): it is then
+    /// False for a header too tall to repeat (see `MAX_REPEATED_HEADER`): it is then
     /// drawn once, split like any tall row.
     repeat_header: bool,
 }
@@ -483,14 +401,21 @@ struct TableFrame<'t> {
 enum Probe {
     Off,
     Waiting,
-    Found(usize, f32),
+    Found(PagePos),
 }
 
-/// Where a block started: page, op count and cursor — see `Renderer::decorate`.
-struct Mark {
+/// A spot in the document: page index and distance from the page top.
+#[derive(Clone, Copy, PartialEq)]
+struct PagePos {
     page: usize,
-    op_index: usize,
     top: f32,
+}
+
+/// Where a block started, and how many ops its first page already had —
+/// see `Renderer::decorate`.
+struct Mark {
+    at: PagePos,
+    op_index: usize,
 }
 
 struct FontIds {
@@ -528,7 +453,7 @@ struct Renderer<'a> {
     /// Where each finished page's content ended (see `content_bottom`).
     page_ends: Vec<f32>,
     /// Where the next line, table row or image lands, when a list item wants
-    /// its marker there (see `note_content_top`).
+    /// its marker there (see `occupy`).
     first_content: Probe,
     /// Bottom of the last thing drawn on the current page, excluding the
     /// spacing after it: where a decoration of the block above should end.
@@ -593,34 +518,39 @@ impl<'a> Renderer<'a> {
         self.cursor_top = MARGIN_PT;
     }
 
+    /// Starts a new page unless `needed` fits under the cursor (or the
+    /// cursor is already at the top, where a new page would not help).
     fn ensure_space(&mut self, needed: f32) {
-        if self.cursor_top + needed > PAGE_HEIGHT_PT - MARGIN_PT {
+        if !self.at_page_top() && self.cursor_top + needed > Self::page_bottom() {
             self.new_page();
         }
     }
 
-    /// Reserves an empty body line and returns its `(page, top)`.
-    fn note_content_top_now(&mut self) -> (usize, f32) {
-        let top = self.cursor_top;
-        self.cursor_top += BODY_LEADING;
-        self.content_bottom = self.cursor_top;
-        (self.pages.len(), top)
+    fn position(&self) -> PagePos {
+        PagePos {
+            page: self.pages.len(),
+            top: self.cursor_top,
+        }
     }
 
-    fn note_content_top(&mut self) {
+    /// Takes `height` of the page for something being drawn there and returns
+    /// its top. Every drawing primitive goes through this, so the first-line
+    /// probe and `content_bottom` stay right.
+    fn occupy(&mut self, height: f32) -> f32 {
         if self.first_content == Probe::Waiting {
-            self.first_content = Probe::Found(self.pages.len(), self.cursor_top);
+            self.first_content = Probe::Found(self.position());
         }
+        let top = self.cursor_top;
+        self.cursor_top += height;
+        self.content_bottom = self.cursor_top;
+        top
     }
 
     /// Advances the cursor by `leading` and returns the PDF-space baseline y
     /// for the line box just reserved.
     fn next_baseline(&mut self, leading: f32) -> f32 {
-        self.note_content_top();
-        let baseline_from_top = self.cursor_top + leading * BASELINE_RATIO;
-        self.cursor_top += leading;
-        self.content_bottom = self.cursor_top;
-        PAGE_HEIGHT_PT - baseline_from_top
+        let top = self.occupy(leading);
+        PAGE_HEIGHT_PT - (top + leading * BASELINE_RATIO)
     }
 
     fn draw_text(&mut self, x: f32, y: f32, text: &str, style: TextStyle) {
@@ -808,21 +738,13 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    /// Starts a new page unless `needed` fits under the cursor (or the
-    /// cursor is already at the top, where waiting would not help).
-    fn keep_together(&mut self, needed: f32) {
-        if !self.at_page_top() && self.cursor_top + needed > Self::page_bottom() {
-            self.new_page();
-        }
-    }
-
     fn render_heading(&mut self, level: u8, spans: &[Span], x0: f32, max_width: f32) {
         let idx = (level as usize).saturating_sub(1).min(5);
         let size = HEADING_SIZES.get(idx).copied().unwrap_or(BODY_SIZE);
         let leading = size * HEADING_LEADING_FACTOR;
         let lines = self.wrap_spans_to_lines(spans, max_width, size, true, &self.fonts.sans_bold);
         // Keep the heading with the start of its section.
-        self.keep_together(
+        self.ensure_space(
             HEADING_SPACING_BEFORE
                 + lines.len() as f32 * leading
                 + HEADING_SPACING_AFTER
@@ -868,11 +790,18 @@ impl<'a> Renderer<'a> {
         self.cursor_top += PARAGRAPH_SPACING_AFTER;
     }
 
+    /// Ops of page `page`: a finished page, or the one being drawn.
+    fn ops_of_page(&mut self, page: usize) -> &mut Vec<Op> {
+        match self.pages.get_mut(page) {
+            Some(finished) => &mut finished.ops,
+            None => &mut self.ops,
+        }
+    }
+
     fn mark(&self) -> Mark {
         Mark {
-            page: self.pages.len(),
+            at: self.position(),
             op_index: self.ops.len(),
-            top: self.cursor_top,
         }
     }
 
@@ -881,9 +810,9 @@ impl<'a> Renderer<'a> {
     /// returns ops inserted before that fragment's content, so they sit
     /// beneath it. Pages where the block drew nothing are skipped.
     fn decorate(&mut self, mark: &Mark, draw: impl Fn(f32, f32) -> Vec<Op>) {
-        for page in mark.page..=self.pages.len() {
-            let top = if page == mark.page {
-                mark.top
+        for page in mark.at.page..=self.pages.len() {
+            let top = if page == mark.at.page {
+                mark.at.top
             } else {
                 MARGIN_PT
             };
@@ -895,12 +824,13 @@ impl<'a> Renderer<'a> {
             if bottom <= top {
                 continue;
             }
-            let at = if page == mark.page { mark.op_index } else { 0 };
-            let ops = draw(PAGE_HEIGHT_PT - top, PAGE_HEIGHT_PT - bottom);
-            let target = match self.pages.get_mut(page) {
-                Some(finished) => &mut finished.ops,
-                None => &mut self.ops,
+            let at = if page == mark.at.page {
+                mark.op_index
+            } else {
+                0
             };
+            let ops = draw(PAGE_HEIGHT_PT - top, PAGE_HEIGHT_PT - bottom);
+            let target = self.ops_of_page(page);
             let at = at.min(target.len());
             target.splice(at..at, ops);
         }
@@ -965,8 +895,7 @@ impl<'a> Renderer<'a> {
             };
             self.draw_text(text_x, y, line, style);
         }
-        self.cursor_top += CODE_PADDING;
-        self.content_bottom = self.cursor_top;
+        self.occupy(CODE_PADDING);
         self.decorate(&mark, |top, bottom| {
             vec![
                 Op::SaveGraphicsState,
@@ -1109,25 +1038,24 @@ impl<'a> Renderer<'a> {
         // the same first line, so its probe is restored afterwards.
         let outer = std::mem::replace(&mut self.first_content, Probe::Waiting);
         self.render_block(first, content_x);
-        let (page, top) = match std::mem::replace(&mut self.first_content, outer) {
-            Probe::Found(page, top) => (page, top),
+        let first_line = match std::mem::replace(&mut self.first_content, outer) {
+            Probe::Found(at) => at,
             // A block that drew nothing still gets its marker, on a line of its own.
             Probe::Off | Probe::Waiting => {
                 self.ensure_space(BODY_LEADING);
-                self.note_content_top_now()
+                let at = self.position();
+                self.occupy(BODY_LEADING);
+                at
             }
         };
         if self.first_content == Probe::Waiting {
-            self.first_content = Probe::Found(page, top);
+            self.first_content = Probe::Found(first_line);
         }
         let saved = std::mem::take(&mut self.ops);
-        let baseline = PAGE_HEIGHT_PT - top - BODY_LEADING * BASELINE_RATIO;
+        let baseline = PAGE_HEIGHT_PT - first_line.top - BODY_LEADING * BASELINE_RATIO;
         self.draw_list_marker(indent, baseline, marker);
         let marker_ops = std::mem::replace(&mut self.ops, saved);
-        match self.pages.get_mut(page) {
-            Some(finished) => finished.ops.extend(marker_ops),
-            None => self.ops.extend(marker_ops),
-        }
+        self.ops_of_page(first_line.page).extend(marker_ops);
         self.render_list_item_blocks(rest, content_x);
     }
 
@@ -1169,9 +1097,7 @@ impl<'a> Renderer<'a> {
 
     fn render_rule(&mut self, x0: f32, max_width: f32) {
         self.ensure_space(BODY_LEADING);
-        self.note_content_top();
-        self.cursor_top += BODY_LEADING * 0.5;
-        let y = PAGE_HEIGHT_PT - self.cursor_top;
+        let y = PAGE_HEIGHT_PT - (self.occupy(BODY_LEADING) + BODY_LEADING * 0.5);
         self.ops.push(Op::SaveGraphicsState);
         self.ops.push(Op::SetOutlineColor {
             col: rgb(RULE_GREY),
@@ -1180,13 +1106,15 @@ impl<'a> Renderer<'a> {
         self.ops.push(Op::DrawLine {
             line: horizontal_line(x0, x0 + max_width, y),
         });
-        self.content_bottom = self.cursor_top;
         self.ops.push(Op::RestoreGraphicsState);
-        self.cursor_top += BODY_LEADING * 0.5;
     }
 
     fn page_bottom() -> f32 {
         PAGE_HEIGHT_PT - MARGIN_PT
+    }
+
+    fn printable_height() -> f32 {
+        Self::page_bottom() - MARGIN_PT
     }
 
     fn at_page_top(&self) -> bool {
@@ -1222,12 +1150,12 @@ impl<'a> Renderer<'a> {
             col_widths: &col_widths,
             alignments,
             header: &header,
-            repeat_header: header.height() <= (Self::page_bottom() - MARGIN_PT) / 2.0,
+            repeat_header: header.height() <= Self::printable_height() * MAX_REPEATED_HEADER,
         };
 
         // Keep the header with the first row (or the first line of it).
         let first = rows.first().map_or(0.0, |r| row_height(r.lines.min(1)));
-        self.keep_together(TABLE_SPACING_BEFORE + header.height() + first);
+        self.ensure_space(TABLE_SPACING_BEFORE + header.height() + first);
         self.space_before(TABLE_SPACING_BEFORE);
         if frame.repeat_header {
             self.draw_row_part(&frame, &header, 0..header.lines);
@@ -1253,7 +1181,7 @@ impl<'a> Renderer<'a> {
         } else {
             0.0
         };
-        let fresh_page_room = Self::page_bottom() - MARGIN_PT - repeated;
+        let fresh_page_room = Self::printable_height() - repeated;
         if self.cursor_top + row.height() > Self::page_bottom() && row.height() <= fresh_page_room {
             self.continue_table_on_new_page(frame);
         }
@@ -1278,10 +1206,7 @@ impl<'a> Renderer<'a> {
     /// Draws lines `range` of every cell of `row` as one bordered row.
     fn draw_row_part(&mut self, frame: &TableFrame<'_>, row: &RowLayout, range: Range<usize>) {
         let row_height = row_height(range.len());
-        self.note_content_top();
-        let row_top = self.cursor_top;
-        self.cursor_top += row_height;
-        self.content_bottom = self.cursor_top;
+        let row_top = self.occupy(row_height);
         let row_top_pdf_y = PAGE_HEIGHT_PT - row_top;
         let row_bottom_pdf_y = row_top_pdf_y - row_height;
         let space_width = text_width_pt(&self.fonts.sans_regular, " ", TABLE_FONT_SIZE);
@@ -1389,21 +1314,14 @@ impl<'a> Renderer<'a> {
         } else {
             CAPTION_GAP + caption.len() as f32 * CAPTION_LEADING
         };
-        let printable_height = PAGE_HEIGHT_PT - 2.0 * MARGIN_PT;
+        let printable_height = Self::printable_height();
         // Never upscale; keep the caption on the image's page.
         let scale = PT_PER_PX
             .min(max_width / placed.width_px)
             .min(((printable_height - caption_height) / placed.height_px).max(0.0));
         let (width, height) = (placed.width_px * scale, placed.height_px * scale);
-        if self.cursor_top > MARGIN_PT
-            && self.cursor_top + height + caption_height > PAGE_HEIGHT_PT - MARGIN_PT
-        {
-            self.new_page();
-        }
-        self.note_content_top();
-        self.cursor_top += height;
-        self.content_bottom = self.cursor_top;
-        let bottom = PAGE_HEIGHT_PT - self.cursor_top;
+        self.ensure_space(height + caption_height);
+        let bottom = PAGE_HEIGHT_PT - (self.occupy(height) + height);
         self.ops.push(Op::UseXobject {
             id: placed.id,
             transform: XObjectTransform {
@@ -1997,7 +1915,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let demand = cell_demand(&fonts, &spans, false);
+        let demand = table::cell_demand(&fonts, &spans, false);
         let expected = text_width_pt(&fonts.sans_regular, "regular text ", TABLE_FONT_SIZE)
             + text_width_pt(&fonts.sans_bold, "b", TABLE_FONT_SIZE)
             + 2.0 * TABLE_CELL_PADDING;
@@ -2057,9 +1975,8 @@ mod tests {
     fn header_is_never_left_alone_at_the_bottom_of_a_page() {
         // 28 one-line paragraphs (22 pt each) leave 32 pt: room for the
         // header row (4 + 21 pt) but not for header + first row (46 pt).
-        let filler: Vec<Block> = (0..28).map(|_| paragraph(vec![Span::plain("x")])).collect();
         let rendered = {
-            let mut blocks = filler;
+            let mut blocks = filler(28);
             blocks.push(table(&["Name", "Value"], &numbered_rows(3)));
             render_with(&blocks, &Images::new())
         };
