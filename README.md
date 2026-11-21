@@ -99,8 +99,8 @@ From the repo root, run `just` to list recipes. Common entry points:
 
 See [`cli/examples/`](cli/examples/) for inputs (`simple.md`, `kitchen-sink.md` — core
 constructs, `features.md` — strikethrough, task lists, images, footnotes and raw
-HTML, `nested-and-long.md` — nested lists and multi-page pagination). The
-generated example PDFs are committed.
+HTML, `nested-and-long.md` — nested lists and multi-page pagination). Example
+PDFs are not committed; see [`.gitignore`](.gitignore).
 
 ## PDF → Markdown (pdf2md)
 
