@@ -31,6 +31,9 @@ pub type Cell = Vec<Vec<Glyph>>;
 pub struct Table {
     /// `[x0, y0, x1, y1]` in user space.
     pub bbox: [f32; 4],
+    /// Column boundaries, left to right (`align.len() + 1` values): drawn
+    /// rulings, or the middle of the gaps between aligned text columns.
+    pub columns: Vec<f32>,
     pub align: Vec<Align>,
     /// `rows[0]` is the header row; every row has `align.len()` cells.
     pub rows: Vec<Vec<Cell>>,
@@ -330,6 +333,7 @@ fn grid(
     Ok((
         Table {
             bbox,
+            columns: xs,
             align,
             rows: table_rows,
         },
@@ -607,8 +611,13 @@ pub fn aligned(rows: &[Vec<Piece>], min_gap: f32, misses: usize, merge: bool) ->
             cell.retain(|line| !line.is_empty());
         }
     }
+    let columns = std::iter::once(left)
+        .chain(gaps.iter().map(|&(a, b)| f32::midpoint(a, b)))
+        .chain(std::iter::once(right))
+        .collect();
     Some(Table {
         bbox: [left, bottom, right, top],
+        columns,
         align,
         rows: table_rows,
     })

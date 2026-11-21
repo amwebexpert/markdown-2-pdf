@@ -138,3 +138,28 @@ fn features_example_snapshot() {
     assert_eq!(output.assets.len(), 1);
     insta::assert_snapshot!(output.markdown);
 }
+
+fn long_table(rows: usize) -> String {
+    let body: Vec<String> = (1..=rows).map(|i| format!("| row{i} | {i} |")).collect();
+    let body = body.join("\n");
+    format!("Intro.\n\n| Name | Value |\n| :-- | --: |\n{body}\n\nAfter.\n")
+}
+
+#[test]
+fn table_split_across_pages_comes_back_as_one_table() {
+    let markdown = round_trip(&long_table(120));
+    assert_eq!(
+        markdown.matches("| Name | Value |").count(),
+        1,
+        "{markdown}"
+    );
+    assert_eq!(markdown.matches("| :-- | --: |").count(), 1);
+    let rows: Vec<&str> = markdown
+        .lines()
+        .filter(|l| l.starts_with("| row"))
+        .collect();
+    let expected: Vec<String> = (1..=120).map(|i| format!("| row{i} | {i} |")).collect();
+    assert_eq!(rows, expected);
+    assert!(markdown.starts_with("Intro.\n\n| Name"));
+    assert!(markdown.trim_end().ends_with("After."));
+}

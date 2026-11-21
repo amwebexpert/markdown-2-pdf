@@ -6,6 +6,7 @@
 #![warn(missing_docs)]
 
 mod blocks;
+mod continuation;
 mod emit;
 mod error;
 mod font;
@@ -149,7 +150,12 @@ pub fn convert(pdf: &[u8], options: &Options) -> Result<Output, Pdf2MdError> {
     let mut items = layout::items(&extracted, options.keep_headers)
         .into_iter()
         .peekable();
-    let page_items: Vec<PageItems> = failed
+    let mut extracted_boxes = extracted.iter().map(|page| page.bbox);
+    let page_boxes: Vec<Option<[f32; 4]>> = failed
+        .iter()
+        .map(|&failed| if failed { None } else { extracted_boxes.next() })
+        .collect();
+    let mut page_items: Vec<PageItems> = failed
         .into_iter()
         .zip(&selected)
         .map(|(failed, (number, _))| {
@@ -163,6 +169,10 @@ pub fn convert(pdf: &[u8], options: &Options) -> Result<Output, Pdf2MdError> {
             PageItems::Items(on_page)
         })
         .collect();
+    warnings.extend(continuation::merge_across_pages(
+        &mut page_items,
+        &page_boxes,
+    ));
 
     let mut assets = Assets::new(&doc, &options.images);
     let blocks = blocks::build(page_items, &mut |number, index| {
