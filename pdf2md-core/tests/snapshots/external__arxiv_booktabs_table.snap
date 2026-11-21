@@ -13,14 +13,14 @@ expression: md
 
 **Table II:** Unit times of the effort model. Central values are used unless stated; the range gives the low and high settings. Two parameters, the time to investigate an attribution (*tx*) and the overhead of a researcher’s session (*s*), are not measured in any published source: both are varied across their ranges.
 
-| Activity Central | Range Basis |
-| :-- | :-- |
-| Verify a confirmed output, *tv* | 15 s 10–20 s screening medians \[35\] |
-| Check an unconfirmed output, *tc* | 35 s 35–74 s screening mean \[26\]; copy cataloguing \[55\] |
-| Investigate an attribution, *tx* | 5 min 1–15 min not measured; upper value from full-text assessment \[65\] |
-| Enter a missing output, *te* | 3 min 3–10 min manual entry \[16, 58\]; deposit \[66\] |
-| Researcher decision, *td* | 15 s as *tv* |
-| Session overhead, *s* | 2 min 0–10 min not measured; varied; authentication \[51\] |
+| Activity | Central | Range | Basis |
+| :-- | --: | --: | :-- |
+| Verify a confirmed output, *tv* | 15 s | 10–20 s | screening medians \[35\] |
+| Check an unconfirmed output, *tc* | 35 s | 35–74 s | screening mean \[26\]; copy cataloguing \[55\] |
+| Investigate an attribution, *tx* | 5 min | 1–15 min | not measured; upper value from full-text assessment \[65\] |
+| Enter a missing output, *te* | 3 min | 3–10 min | manual entry \[16, 58\]; deposit \[66\] |
+| Researcher decision, *td* | 15 s |   | as *tv* |
+| Session overhead, *s* | 2 min | 0–10 min | not measured; varied; authentication \[51\] |
 
 before the observation date. A feed delivers an output when the output is added to the source, not when it was published, so the recurring effort is measured by the date each output was added. Dimensions records that date for every publication \[13\], and its index is updated daily \[25\]. OpenAlex’s record creation dates cannot be used, because they were reset in bulk in October 2025. Each output is therefore dated by the day the same DOI entered Dimensions, for both sources. Dimensions holds 99.7% of the DOIs that OpenAlex attributes; the rest are dated by their Crossref registration.
 

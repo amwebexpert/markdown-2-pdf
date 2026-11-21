@@ -493,7 +493,20 @@ fn booktabs(rules: Vec<Ruling>, glyphs: &mut Vec<Glyph>) -> (Vec<Table>, Vec<Rul
         let rows: Vec<Vec<Piece>> = lines.into_iter().map(|line| split(line, 0.6)).collect();
         let misses = usize::from(rows.len() >= 4);
         *glyphs = outer;
-        if let Some(mut table) = aligned(&rows, 0.8, misses, false) {
+        // Columns set too tightly for a shared gap: follow the header words.
+        let header_guided = || {
+            (!other_aligned_text(&rows))
+                .then(|| table_from_gaps(&rows, &header_gaps(&rows, misses), false))
+                .flatten()
+        };
+        let best = match aligned(&rows, 0.8, misses, false) {
+            Some(by_gaps) => match header_guided() {
+                Some(by_header) if by_header.align.len() > by_gaps.align.len() => Some(by_header),
+                _ => Some(by_gaps),
+            },
+            None => header_guided(),
+        };
+        if let Some(mut table) = best {
             table.bbox = [from, bottom, to, top];
             table.evidence = Evidence::RuleOnly;
             tables.push(table);
@@ -621,25 +634,97 @@ pub fn aligned(rows: &[Vec<Piece>], min_gap: f32, misses: usize, merge: bool) ->
     }
     let pieces = rows.iter().flatten();
     let left = pieces.clone().map(|p| p.x0).reduce(f32::min)?;
+    let right = pieces.map(|p| p.x1).reduce(f32::max)?;
+    let size = median_size(rows)?;
+    let gaps = shared_gaps(rows, left, right, min_gap * size, misses);
+    table_from_gaps(rows, &gaps, merge)
+}
+
+/// Median glyph size of the rows.
+fn median_size(rows: &[Vec<Piece>]) -> Option<f32> {
+    let mut sizes: Vec<f32> = rows
+        .iter()
+        .flatten()
+        .flat_map(|p| &p.glyphs)
+        .map(|g| g.size)
+        .collect();
+    sizes.sort_by(f32::total_cmp);
+    sizes.get(sizes.len() / 2).copied()
+}
+
+/// Column gaps read from the header row (`rows[0]`) when the columns are set
+/// too tightly for a shared gap. Between two consecutive header words, the
+/// column edge is the rightmost x that at most `misses` body words cross, so
+/// left- and right-aligned columns both split correctly. Edges opening a
+/// column with text in fewer than half the body rows are dropped, so a header
+/// cell of several words does not become several columns.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "page coordinates are small positive numbers"
+)]
+fn header_gaps(rows: &[Vec<Piece>], misses: usize) -> Vec<(f32, f32)> {
+    let words = |row: &Vec<Piece>| -> Vec<Piece> {
+        row.iter()
+            .flat_map(|p| split(p.glyphs.clone(), WORD_GAP))
+            .collect()
+    };
+    let Some((header, body)) = rows.split_first() else {
+        return Vec::new();
+    };
+    let header = words(header);
+    let body: Vec<Vec<Piece>> = body.iter().map(words).collect();
+    if body.is_empty() {
+        return Vec::new();
+    }
+    let crossing = |x: f32| {
+        body.iter()
+            .filter(|row| row.iter().any(|w| w.x0 < x && w.x1 > x))
+            .count()
+    };
+    let mut edges: Vec<f32> = header
+        .windows(2)
+        .filter_map(|pair| {
+            let [previous, word] = pair else { return None };
+            let steps = ((word.x0 - previous.x1) * 2.0).max(0.0) as usize;
+            (0..=steps)
+                .map(|step| word.x0 - step as f32 / 2.0)
+                .find(|&x| crossing(x) <= misses)
+        })
+        .collect();
+    // Drop edges opening a mostly empty column, until none does.
+    while let Some(k) = (0..edges.len()).find(|&k| {
+        let from = edges.get(k).copied().unwrap_or(f32::MAX);
+        let to = edges.get(k + 1).copied().unwrap_or(f32::MAX);
+        let filled = body
+            .iter()
+            .filter(|row| row.iter().any(|w| w.x0 >= from && w.x0 < to))
+            .count();
+        filled * 2 < body.len()
+    }) {
+        edges.remove(k);
+    }
+    edges.into_iter().map(|edge| (edge, edge)).collect()
+}
+
+/// Builds the table for columns split at `gaps`; `None` when there is no
+/// gap or the table shape is too sparse. `merge` folds wrapped rows together
+/// and then requires ≥ 3 rows.
+fn table_from_gaps(rows: &[Vec<Piece>], gaps: &[(f32, f32)], merge: bool) -> Option<Table> {
+    if gaps.is_empty() {
+        return None;
+    }
+    let pieces = rows.iter().flatten();
+    let left = pieces.clone().map(|p| p.x0).reduce(f32::min)?;
     let right = pieces.clone().map(|p| p.x1).reduce(f32::max)?;
     let glyphs = pieces.flat_map(|p| &p.glyphs);
     let top = glyphs
         .clone()
         .map(|g| g.y + g.size)
         .fold(f32::MIN, f32::max);
-    let bottom = glyphs.clone().map(|g| g.y).fold(f32::MAX, f32::min);
-    let size = {
-        let mut sizes: Vec<f32> = glyphs.map(|g| g.size).collect();
-        sizes.sort_by(f32::total_cmp);
-        sizes.get(sizes.len() / 2).copied()?
-    };
-
-    let gaps = shared_gaps(rows, left, right, min_gap * size, misses);
-    if gaps.is_empty() {
-        return None;
-    }
+    let bottom = glyphs.map(|g| g.y).fold(f32::MAX, f32::min);
     let cols = gaps.len() + 1;
-    let (mut table_rows, mut boxes) = fill(rows, &gaps);
+    let (mut table_rows, mut boxes) = fill(rows, gaps);
     if merge {
         merge_continuations(&mut table_rows, &mut boxes);
         if table_rows.len() < 3 {
@@ -921,6 +1006,77 @@ mod tests {
             [["Model", "Score"], ["alpha", "0.91"], ["beta", "0.87"]]
         );
         assert!(ruled.glyphs.is_empty());
+    }
+
+    fn booktabs(lines: &[(f32, &[(&str, f32)])]) -> Ruled {
+        let rulings = vec![
+            h(700.0, 90.0, 400.0),
+            h(684.0, 90.0, 400.0),
+            h(640.0, 90.0, 400.0),
+        ];
+        let glyphs = lines
+            .iter()
+            .flat_map(|(y, words)| words.iter().flat_map(|(t, x)| word(t, *x, *y)))
+            .collect();
+        ruled(&rulings, glyphs)
+    }
+
+    #[test]
+    fn tightly_set_booktabs_columns_follow_the_header_words() {
+        // Columns only 4 pt (0.4 em) apart: too tight for the shared-gap sweep.
+        let ruled = booktabs(&[
+            (
+                688.0,
+                &[
+                    ("Activity", 100.0),
+                    ("Central", 200.0),
+                    ("Range", 239.0),
+                    ("Basis", 268.0),
+                ],
+            ),
+            (
+                670.0,
+                &[
+                    ("verify", 100.0),
+                    ("15s", 220.0),
+                    ("10-20", 239.0),
+                    ("medians", 268.0),
+                ],
+            ),
+            (
+                656.0,
+                &[
+                    ("check", 100.0),
+                    ("35s", 220.0),
+                    ("35-74", 239.0),
+                    ("mean", 268.0),
+                ],
+            ),
+        ]);
+        assert_eq!(
+            texts(&ruled.tables[0]),
+            [
+                ["Activity", "Central", "Range", "Basis"],
+                ["verify", "15s", "10-20", "medians"],
+                ["check", "35s", "35-74", "mean"],
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_word_header_cell_is_not_split_into_columns() {
+        let ruled = booktabs(&[
+            (
+                688.0,
+                &[("Item", 100.0), ("Total", 200.0), ("effort", 230.0)],
+            ),
+            (670.0, &[("a", 100.0), ("12", 200.0)]),
+            (656.0, &[("b", 100.0), ("7", 200.0)]),
+        ]);
+        assert_eq!(
+            texts(&ruled.tables[0]),
+            [["Item", "Totaleffort"], ["a", "12"], ["b", "7"]]
+        );
     }
 
     #[test]
