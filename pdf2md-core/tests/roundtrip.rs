@@ -163,3 +163,49 @@ fn table_split_across_pages_comes_back_as_one_table() {
     assert!(markdown.starts_with("Intro.\n\n| Name"));
     assert!(markdown.trim_end().ends_with("After."));
 }
+
+fn table_md(header: [&str; 3], prefix: &str, rows: usize) -> String {
+    let body: Vec<String> = (1..=rows)
+        .map(|i| format!("| {prefix}{i} | value {i} | note {i} |"))
+        .collect();
+    format!(
+        "| {} | {} | {} |\n| --- | --- | --- |\n{}\n",
+        header[0],
+        header[1],
+        header[2],
+        body.join("\n")
+    )
+}
+
+#[test]
+fn back_to_back_tables_with_the_same_columns_stay_separate() {
+    for rows in [26, 28, 29] {
+        let md = format!(
+            "{}\n{}",
+            table_md(["Name", "Value", "Note"], "a", rows),
+            table_md(["Nome", "Velue", "Nota"], "z", 20)
+        );
+        let markdown = round_trip(&md);
+        assert_eq!(
+            markdown.matches("| Name | Value | Note |").count(),
+            1,
+            "{rows}: {markdown}"
+        );
+        assert_eq!(
+            markdown.matches("| Nome | Velue | Nota |").count(),
+            1,
+            "{rows}: {markdown}"
+        );
+        assert!(!markdown.contains("**Nome**"), "{rows}: {markdown}");
+        let first_header = markdown.find("| Name |").unwrap();
+        let second_header = markdown.find("| Nome |").unwrap();
+        assert!(first_header < second_header, "{rows}: tables out of order");
+        let a_rows: Vec<&str> = markdown.lines().filter(|l| l.starts_with("| a")).collect();
+        assert_eq!(a_rows.len(), rows, "{rows}");
+        let second_table = &markdown[second_header..];
+        assert!(
+            !second_table.contains("| a"),
+            "{rows}: a-rows after the second header"
+        );
+    }
+}

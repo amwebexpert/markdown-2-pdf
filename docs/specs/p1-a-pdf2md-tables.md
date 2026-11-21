@@ -9,8 +9,9 @@ PR (`feat/pdf2md-tables`).
   (`Span { row, col, rows, cols }`) and `evidence` (`Ruled | RuleOnly |
   Aligned`). Not added: per-cell bboxes, `header_rows` (row 0 is still the
   header), a numeric score.
-- **Goal 2:** collinear/touch tolerances scale with the median glyph size
-  (0.2/0.4 em, never below 1/2 pt). Partial verticals were already handled
+- **Goal 2:** collinear/touch tolerances scale with the page's median glyph
+  size (not the cluster's), at 0.2/0.4 em, clamped to 1–2 pt and 2–4 pt so
+  large type can't fuse separate tables. Partial verticals were already handled
   by the span union. Decorative-line filtering is not done.
 - **Goal 3:** tightly set booktabs columns are split at the header words. The
   arXiv Table II snapshot is fixed (4 columns). "Header above the top rule"
@@ -21,7 +22,16 @@ PR (`feat/pdf2md-tables`).
 - **Goal 5:** merged cells are recorded and a warning is emitted. The output
   is unchanged (text in the first cell).
 - **Goal 6:** `continuation.rs` merges tables that span pages, as specified,
-  with one warning per merge. Repeated headers are always dropped.
+  with one warning per merge. Repeated headers are always dropped. Kept
+  running heads and page numbers (lines in the furniture band) between the
+  fragments are skipped. A next-page table whose first row is bold and
+  differs from the open table's header is a new table, never merged. Known
+  limit: a new table with the same columns *and the same header text* is
+  read as a continuation.
+- Fixed along the way: two tables stacked on a page with no text between
+  them were emitted bottom one first (placeholders were ordered only
+  against text). Merging made this produce mixed tables, so it is fixed
+  here.
 - **Goal 7:** warnings cover merged cells, near misses and cross-page merges.
 
 ## Context (current pipeline, `pdf2md-core/src/`)

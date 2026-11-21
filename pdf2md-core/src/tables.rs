@@ -12,6 +12,9 @@ const TOUCH: f32 = 2.0;
 /// divider drawn 1.5 pt off or a rule broken by 3 pt still lines up.
 const COLLINEAR_SHARE: f32 = 0.2;
 const TOUCH_SHARE: f32 = 0.4;
+/// Upper bounds, so large type can't fuse separate tables or a nearby rule.
+const MAX_COLLINEAR: f32 = 2.0;
+const MAX_TOUCH: f32 = 4.0;
 
 /// Geometric tolerances (pt) for one page, scaled to its text.
 #[derive(Debug, Clone, Copy)]
@@ -24,8 +27,8 @@ impl Tolerance {
     fn for_glyphs(glyphs: &[Glyph]) -> Self {
         let size = median_glyph_size(glyphs.iter().filter(|g| !g.synthetic)).unwrap_or(0.0);
         Tolerance {
-            collinear: COLLINEAR.max(COLLINEAR_SHARE * size),
-            touch: TOUCH.max(TOUCH_SHARE * size),
+            collinear: (COLLINEAR_SHARE * size).clamp(COLLINEAR, MAX_COLLINEAR),
+            touch: (TOUCH_SHARE * size).clamp(TOUCH, MAX_TOUCH),
         }
     }
 }
@@ -1148,6 +1151,24 @@ mod tests {
         glyphs.extend(word("x", 250.0, 647.0));
         let table = ruled(&rulings, glyphs).tables.remove(0);
         assert_eq!(texts(&table), [["a", "b"], ["mid/edge", "x"]]);
+    }
+
+    #[test]
+    fn tolerances_grow_with_the_text_but_stay_small_for_large_type() {
+        let at = |size: f32| {
+            let mut glyphs = word("x", 0.0, 0.0);
+            for g in &mut glyphs {
+                g.size = size;
+            }
+            Tolerance::for_glyphs(&glyphs)
+        };
+        let small = at(4.0);
+        assert!((small.collinear - COLLINEAR).abs() < 1e-6 && (small.touch - TOUCH).abs() < 1e-6);
+        let body = at(10.0);
+        assert!((body.collinear - 2.0).abs() < 1e-6 && (body.touch - 4.0).abs() < 1e-6);
+        // 24 pt text: capped, so tables 6 pt apart don't touch.
+        let large = at(24.0);
+        assert!(large.collinear <= MAX_COLLINEAR && large.touch <= MAX_TOUCH);
     }
 
     #[test]

@@ -19,7 +19,7 @@ const BASELINE_TOLERANCE: f32 = 0.45;
 /// Horizontal gap (in font sizes) that splits a baseline into segments.
 const SEGMENT_GAP: f32 = 1.5;
 /// Fraction of the page height treated as header/footer band at each edge.
-const FURNITURE_BAND: f32 = 0.08;
+pub const FURNITURE_BAND: f32 = 0.08;
 /// Minimum gutter width (pt) for two-column detection.
 const MIN_GUTTER: f32 = 6.0;
 /// A horizontal rule must span at least this share of the page width.
@@ -656,9 +656,11 @@ fn page_items(
     // Things join the top-down segment order by the top of their box.
     for (index, (_, bbox)) in things.iter().enumerate() {
         let placeholder = Segment::thing(index, *bbox, size);
+        // Compare with things placed already too: two tables stacked with no
+        // text between them keep their top-down order.
         let at = segments
             .iter()
-            .position(|s| s.thing.is_none() && s.y < placeholder.y)
+            .position(|s| s.y < placeholder.y)
             .unwrap_or(segments.len());
         segments.insert(at, placeholder);
     }
