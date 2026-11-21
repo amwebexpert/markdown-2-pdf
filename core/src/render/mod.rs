@@ -39,6 +39,10 @@ const HEADING_SPACING_AFTER: f32 = 6.0;
 /// Room a heading reserves for its section's start: two body lines.
 const HEADING_KEEP_WITH_NEXT: f32 = 2.0 * BODY_LEADING;
 const CODE_SPACING_BEFORE: f32 = 4.0;
+/// Widow/orphan control: only paragraphs of this many lines are kept from
+/// leaving fewer than `MIN_LINES_PER_SIDE` lines on either side of a break.
+const MIN_LINES_TO_SPLIT: usize = 4;
+const MIN_LINES_PER_SIDE: usize = 2;
 const CODE_PADDING: f32 = 4.0;
 const CODE_BACKGROUND: (f32, f32, f32) = (0.96, 0.96, 0.96);
 /// Blockquote side bar: x offset inside the quote indent, and stroke width.
@@ -474,6 +478,14 @@ struct TableFrame<'t> {
     repeat_header: bool,
 }
 
+/// Lookout for the first content a block draws: `(page, top)` once found.
+#[derive(Clone, Copy, PartialEq)]
+enum Probe {
+    Off,
+    Waiting,
+    Found(usize, f32),
+}
+
 /// Where a block started: page, op count and cursor — see `Renderer::decorate`.
 struct Mark {
     page: usize,
@@ -515,6 +527,9 @@ struct Renderer<'a> {
     pages: Vec<PdfPage>,
     /// Where each finished page's content ended (see `content_bottom`).
     page_ends: Vec<f32>,
+    /// Where the next line, table row or image lands, when a list item wants
+    /// its marker there (see `note_content_top`).
+    first_content: Probe,
     /// Bottom of the last thing drawn on the current page, excluding the
     /// spacing after it: where a decoration of the block above should end.
     content_bottom: f32,
@@ -547,6 +562,7 @@ impl<'a> Renderer<'a> {
             pages: Vec::new(),
             page_ends: Vec::new(),
             content_bottom: MARGIN_PT,
+            first_content: Probe::Off,
             ops: Vec::new(),
             cursor_top: MARGIN_PT,
         })
@@ -583,9 +599,24 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// Reserves an empty body line and returns its `(page, top)`.
+    fn note_content_top_now(&mut self) -> (usize, f32) {
+        let top = self.cursor_top;
+        self.cursor_top += BODY_LEADING;
+        self.content_bottom = self.cursor_top;
+        (self.pages.len(), top)
+    }
+
+    fn note_content_top(&mut self) {
+        if self.first_content == Probe::Waiting {
+            self.first_content = Probe::Found(self.pages.len(), self.cursor_top);
+        }
+    }
+
     /// Advances the cursor by `leading` and returns the PDF-space baseline y
     /// for the line box just reserved.
     fn next_baseline(&mut self, leading: f32) -> f32 {
+        self.note_content_top();
         let baseline_from_top = self.cursor_top + leading * BASELINE_RATIO;
         self.cursor_top += leading;
         self.content_bottom = self.cursor_top;
@@ -802,10 +833,38 @@ impl<'a> Renderer<'a> {
         self.cursor_top += HEADING_SPACING_AFTER;
     }
 
+    /// Index of the first line to move to the next page, if the lines don't
+    /// all fit under the cursor. Paragraphs of [`MIN_LINES_TO_SPLIT`]+ lines
+    /// keep at least [`MIN_LINES_PER_SIDE`] lines on each side of the break
+    /// (no orphan at the page bottom, no widow at the next page's top).
+    fn paragraph_break(&self, count: usize, leading: f32) -> Option<usize> {
+        let fit = (1..=count)
+            .take_while(|&n| self.cursor_top + n as f32 * leading <= Self::page_bottom())
+            .count();
+        if fit == count {
+            return None;
+        }
+        if count < MIN_LINES_TO_SPLIT {
+            return Some(fit);
+        }
+        if fit < MIN_LINES_PER_SIDE {
+            return Some(0);
+        }
+        Some(fit.min(count - MIN_LINES_PER_SIDE))
+    }
+
     fn render_paragraph(&mut self, spans: &[Span], x0: f32, max_width: f32) {
         let lines =
             self.wrap_spans_to_lines(spans, max_width, BODY_SIZE, false, &self.fonts.sans_regular);
-        self.render_lines(&lines, x0, BODY_SIZE, BODY_LEADING);
+        let split = self
+            .paragraph_break(lines.len(), BODY_LEADING)
+            .unwrap_or(lines.len());
+        let (before, after) = lines.split_at(split);
+        self.render_lines(before, x0, BODY_SIZE, BODY_LEADING);
+        if !after.is_empty() && !self.at_page_top() {
+            self.new_page();
+        }
+        self.render_lines(after, x0, BODY_SIZE, BODY_LEADING);
         self.cursor_top += PARAGRAPH_SPACING_AFTER;
     }
 
@@ -1045,9 +1104,30 @@ impl<'a> Renderer<'a> {
         content_x: f32,
         marker: &Marker,
     ) {
-        let y = self.reserve_list_line_baseline();
-        self.draw_list_marker(indent, y, marker);
+        // The marker goes on the block's first line, wherever (and on
+        // whichever page) that ends up. An enclosing item may be waiting for
+        // the same first line, so its probe is restored afterwards.
+        let outer = std::mem::replace(&mut self.first_content, Probe::Waiting);
         self.render_block(first, content_x);
+        let (page, top) = match std::mem::replace(&mut self.first_content, outer) {
+            Probe::Found(page, top) => (page, top),
+            // A block that drew nothing still gets its marker, on a line of its own.
+            Probe::Off | Probe::Waiting => {
+                self.ensure_space(BODY_LEADING);
+                self.note_content_top_now()
+            }
+        };
+        if self.first_content == Probe::Waiting {
+            self.first_content = Probe::Found(page, top);
+        }
+        let saved = std::mem::take(&mut self.ops);
+        let baseline = PAGE_HEIGHT_PT - top - BODY_LEADING * BASELINE_RATIO;
+        self.draw_list_marker(indent, baseline, marker);
+        let marker_ops = std::mem::replace(&mut self.ops, saved);
+        match self.pages.get_mut(page) {
+            Some(finished) => finished.ops.extend(marker_ops),
+            None => self.ops.extend(marker_ops),
+        }
         self.render_list_item_blocks(rest, content_x);
     }
 
@@ -1089,6 +1169,7 @@ impl<'a> Renderer<'a> {
 
     fn render_rule(&mut self, x0: f32, max_width: f32) {
         self.ensure_space(BODY_LEADING);
+        self.note_content_top();
         self.cursor_top += BODY_LEADING * 0.5;
         let y = PAGE_HEIGHT_PT - self.cursor_top;
         self.ops.push(Op::SaveGraphicsState);
@@ -1197,6 +1278,7 @@ impl<'a> Renderer<'a> {
     /// Draws lines `range` of every cell of `row` as one bordered row.
     fn draw_row_part(&mut self, frame: &TableFrame<'_>, row: &RowLayout, range: Range<usize>) {
         let row_height = row_height(range.len());
+        self.note_content_top();
         let row_top = self.cursor_top;
         self.cursor_top += row_height;
         self.content_bottom = self.cursor_top;
@@ -1318,6 +1400,7 @@ impl<'a> Renderer<'a> {
         {
             self.new_page();
         }
+        self.note_content_top();
         self.cursor_top += height;
         self.content_bottom = self.cursor_top;
         let bottom = PAGE_HEIGHT_PT - self.cursor_top;
@@ -2198,6 +2281,111 @@ mod tests {
                 "bar runs past the last line: {bottom} vs {baseline}"
             );
         }
+    }
+
+    /// A paragraph of `count` lines `{prefix}1`, `{prefix}2`, … (hard breaks).
+    fn lines_paragraph(prefix: &str, count: usize) -> Block {
+        let text = (1..=count)
+            .map(|i| format!("{prefix}{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        paragraph(vec![Span::plain(text)])
+    }
+
+    /// Lines of the `p…` paragraph on each page.
+    fn p_lines_per_page(blocks: &[Block]) -> Vec<usize> {
+        page_texts(&render_with(blocks, &Images::new()))
+            .iter()
+            .map(|texts| texts.iter().filter(|t| t.starts_with('p')).count())
+            .collect()
+    }
+
+    #[test]
+    fn paragraph_does_not_leave_a_single_line_at_the_bottom_of_a_page() {
+        // 44 filler lines (+ 8 pt) leave 24 pt: room for one 14 pt line.
+        let blocks = [lines_paragraph("f", 44), lines_paragraph("p", 5)];
+        assert_eq!(p_lines_per_page(&blocks), [0, 5]);
+    }
+
+    #[test]
+    fn paragraph_does_not_leave_a_single_line_at_the_top_of_a_page() {
+        // 41 filler lines leave 66 pt: room for 4 of the 5 lines.
+        let blocks = [lines_paragraph("f", 41), lines_paragraph("p", 5)];
+        assert_eq!(p_lines_per_page(&blocks), [3, 2]);
+    }
+
+    #[test]
+    fn short_paragraphs_break_wherever_they_must() {
+        let blocks = [lines_paragraph("f", 44), lines_paragraph("p", 3)];
+        assert_eq!(p_lines_per_page(&blocks), [1, 2]);
+    }
+
+    fn item(blocks: Vec<Block>) -> Block {
+        Block::List {
+            ordered: false,
+            start: 1,
+            items: vec![ListItem { task: None, blocks }],
+        }
+    }
+
+    #[test]
+    fn marker_sits_on_the_first_line_of_a_leading_code_block() {
+        let ops = rendered_ops(&[item(vec![code(2)])]);
+        let runs = text_runs(&ops);
+        let bullet = runs.iter().find(|r| r.0 == "\u{2022}").unwrap();
+        let first_code = runs.iter().find(|r| r.0 == "code1").unwrap();
+        assert!(
+            (bullet.2 - first_code.2).abs() < 3.0,
+            "{bullet:?} vs {first_code:?}"
+        );
+    }
+
+    #[test]
+    fn marker_follows_a_leading_image_to_the_next_page() {
+        let images = Images::from([("a.png".to_string(), png_bytes(200, 200))]);
+        let mut blocks = filler(25);
+        blocks.push(item(vec![image("a.png", "")]));
+        let rendered = render_with(&blocks, &images);
+        assert_eq!(rendered.pages.len(), 2);
+        let marker_page = rendered
+            .pages
+            .iter()
+            .position(|ops| text_runs(ops).iter().any(|r| r.0 == "\u{2022}"))
+            .unwrap();
+        let image_page = rendered
+            .pages
+            .iter()
+            .position(|ops| !placements(ops).is_empty())
+            .unwrap();
+        assert_eq!(marker_page, image_page);
+    }
+
+    #[test]
+    fn every_list_item_keeps_its_marker_whatever_it_starts_with() {
+        let leads = [
+            Block::ThematicBreak,
+            code(1),
+            table(&["h"], &[vec!["c".to_string()]]),
+            Block::BlockQuote(Vec::new()),
+        ];
+        for lead in leads {
+            let ops = rendered_ops(&[item(vec![lead.clone()])]);
+            let bullets = text_runs(&ops).iter().filter(|r| r.0 == "\u{2022}").count();
+            assert_eq!(bullets, 1, "{lead:?}");
+        }
+    }
+
+    #[test]
+    fn nested_block_led_items_put_both_markers_on_the_first_line() {
+        let ops = rendered_ops(&[item(vec![item(vec![code(1)])])]);
+        let runs = text_runs(&ops);
+        let bullets: Vec<f32> = runs
+            .iter()
+            .filter(|r| r.0 == "\u{2022}")
+            .map(|r| r.2)
+            .collect();
+        assert_eq!(bullets.len(), 2);
+        assert!((bullets[0] - bullets[1]).abs() < 0.01, "{bullets:?}");
     }
 
     #[test]
