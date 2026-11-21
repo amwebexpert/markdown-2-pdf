@@ -7,6 +7,8 @@ pub struct Span {
     pub italic: bool,
     pub code: bool,
     pub strike: bool,
+    /// Raised, smaller text (footnote reference numbers).
+    pub superscript: bool,
     pub link: Option<String>,
 }
 

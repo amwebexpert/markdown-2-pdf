@@ -9,32 +9,52 @@
 mod align;
 mod close;
 mod event;
+mod footnote;
 mod frame;
 mod html;
 mod open;
 mod stack;
 
-use pulldown_cmark::{Options, Parser};
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
 use crate::ir::Block;
 
+use footnote::Footnotes;
 use frame::Frame;
+use stack::{flush_dangling_paragraph, push_span};
 
 pub fn parse(input: &str) -> Vec<Block> {
-    let parser = Parser::new_ext(
-        input,
-        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS,
-    );
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES;
     let mut stack: Vec<Frame> = vec![Frame::Container(Vec::new())];
+    let mut footnotes = Footnotes::default();
 
-    for event in parser {
-        event::apply_event(&mut stack, event);
+    for event in Parser::new_ext(input, options) {
+        match event {
+            Event::FootnoteReference(label) => push_span(&mut stack, footnotes.reference(&label)),
+            Event::Start(Tag::FootnoteDefinition(label)) => {
+                flush_dangling_paragraph(&mut stack);
+                footnotes.open_definition(&label);
+                stack.push(Frame::Container(Vec::new()));
+            }
+            Event::End(TagEnd::FootnoteDefinition) => {
+                flush_dangling_paragraph(&mut stack);
+                if let Some(Frame::Container(blocks)) = stack.pop() {
+                    footnotes.close_definition(blocks);
+                }
+            }
+            other => event::apply_event(&mut stack, other),
+        }
     }
 
-    match stack.pop() {
+    let mut blocks = match stack.pop() {
         Some(Frame::Container(blocks)) => blocks,
         _ => Vec::new(),
-    }
+    };
+    blocks.extend(footnotes.into_endnotes());
+    blocks
 }
 
 #[cfg(test)]
@@ -185,6 +205,68 @@ mod tests {
                 assert_eq!(tasks, [Some(false), Some(true)]);
             }
             other => panic!("expected one list, got {other:?}"),
+        }
+    }
+
+    /// Endnotes appended after the body: a rule, then an ordered list.
+    fn endnotes(blocks: &[Block]) -> Vec<String> {
+        match blocks {
+            [
+                ..,
+                Block::ThematicBreak,
+                Block::List {
+                    ordered: true,
+                    start: 1,
+                    items,
+                },
+            ] => items
+                .iter()
+                .map(|i| match i.blocks.as_slice() {
+                    [Block::Paragraph { spans }] => span_text(spans),
+                    other => panic!("expected one paragraph per note, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected trailing endnotes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn footnotes_are_numbered_by_first_reference_and_moved_to_the_end() {
+        let md =
+            "[^b]: second note\n\nOne[^a] two[^B] again[^a].\n\n[^a]: first *note*\n\nAfter.\n";
+        let blocks = parse(md);
+        match blocks.as_slice() {
+            [
+                Block::Paragraph { spans },
+                Block::Paragraph { spans: after },
+                ..,
+            ] => {
+                assert_eq!(span_text(spans), "One1 two2 again1.");
+                let marks: Vec<&str> = spans
+                    .iter()
+                    .filter(|s| s.superscript)
+                    .map(|s| s.text.as_str())
+                    .collect();
+                assert_eq!(marks, ["1", "2", "1"]);
+                assert_eq!(span_text(after), "After.");
+            }
+            other => panic!("expected two paragraphs first, got {other:?}"),
+        }
+        assert_eq!(endnotes(&blocks), ["first note", "second note"]);
+    }
+
+    #[test]
+    fn unreferenced_footnote_definitions_are_kept_after_referenced_ones() {
+        let blocks = parse("[^z]: orphan\n\nText[^a].\n\n[^a]: used\n");
+        assert_eq!(endnotes(&blocks), ["used", "orphan"]);
+    }
+
+    #[test]
+    fn undefined_footnote_reference_stays_literal_and_adds_no_notes() {
+        let blocks = parse("See [^missing].");
+        match blocks.as_slice() {
+            [Block::Paragraph { spans }] => assert_eq!(span_text(spans), "See [^missing]."),
+            other => panic!("expected one paragraph, got {other:?}"),
         }
     }
 

@@ -44,6 +44,10 @@ const STRIKE_RISE: f32 = 0.3;
 const STRIKE_THICKNESS: f32 = 0.06;
 /// Task checkbox side, as a fraction of the body font size.
 const CHECKBOX_SIZE: f32 = 0.7;
+/// Superscript (footnote marks): font size scale and baseline rise, as
+/// fractions of the surrounding text size.
+const SUPERSCRIPT_SCALE: f32 = 0.7;
+const SUPERSCRIPT_RISE: f32 = 0.35;
 const LINK_COLOR: (f32, f32, f32) = (0.06, 0.32, 0.78);
 const BLACK: (f32, f32, f32) = (0.0, 0.0, 0.0);
 const RULE_GREY: (f32, f32, f32) = (0.7, 0.7, 0.7);
@@ -105,12 +109,18 @@ struct Fragment {
     italic: bool,
     code: bool,
     strike: bool,
+    superscript: bool,
     link: Option<String>,
     width: f32,
 }
 
 impl Fragment {
     fn new(text: String, span: &Span, bold: bool, fonts: &FontSet, size: f32) -> Self {
+        let size = if span.superscript {
+            size * SUPERSCRIPT_SCALE
+        } else {
+            size
+        };
         let width = text_width_pt(fonts.resolve(bold, span.italic, span.code), &text, size);
         Fragment {
             text,
@@ -118,8 +128,18 @@ impl Fragment {
             italic: span.italic,
             code: span.code,
             strike: span.strike,
+            superscript: span.superscript,
             link: span.link.clone(),
             width,
+        }
+    }
+
+    /// Font size and baseline rise of this fragment on a line of `size`.
+    fn metrics(&self, size: f32) -> (f32, f32) {
+        if self.superscript {
+            (size * SUPERSCRIPT_SCALE, size * SUPERSCRIPT_RISE)
+        } else {
+            (size, 0.0)
         }
     }
 }
@@ -267,8 +287,9 @@ fn hard_wrap_word(word: Word, fonts: &FontSet, size: f32, max_width: f32) -> Vec
             width: 0.0,
             ..fragment.clone()
         };
+        let (char_size, _) = fragment.metrics(size);
         for ch in fragment.text.chars() {
-            let w = text_width_pt(font, ch.encode_utf8(&mut [0; 4]), size);
+            let w = text_width_pt(font, ch.encode_utf8(&mut [0; 4]), char_size);
             if current.width + piece.width + w > max_width
                 && (!current.fragments.is_empty() || !piece.text.is_empty())
             {
@@ -536,14 +557,15 @@ impl Renderer {
                 } else {
                     BLACK
                 };
+                let (fragment_size, rise) = fragment.metrics(size);
                 let style = TextStyle {
                     bold: fragment.bold,
                     italic: fragment.italic,
                     code: fragment.code,
-                    size,
+                    size: fragment_size,
                     color,
                 };
-                self.draw_text(x, y, &fragment.text, style);
+                self.draw_text(x, y + rise, &fragment.text, style);
                 if let Some(url) = fragment.link.clone() {
                     self.add_link_annotation(x, y, fragment.width, size, url);
                 }
@@ -964,6 +986,7 @@ mod tests {
             italic: false,
             code: false,
             strike: false,
+            superscript: false,
             link: None,
             width,
         });
@@ -1207,6 +1230,35 @@ mod tests {
             .filter(|l| l.points.len() == 3)
             .count();
         assert_eq!(checks, 1, "only the checked item gets a check mark");
+    }
+
+    #[test]
+    fn superscript_is_smaller_raised_and_attached_to_its_word() {
+        let fonts = FontSet::load().unwrap();
+        let ops = rendered_ops(&[paragraph(vec![
+            Span::plain("One"),
+            Span {
+                text: "12".into(),
+                superscript: true,
+                ..Default::default()
+            },
+            Span::plain(" two"),
+        ])]);
+        let runs = text_runs(&ops);
+        let sizes: Vec<f32> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::SetFont { size, .. } => Some(size.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sizes, [BODY_SIZE, BODY_SIZE * SUPERSCRIPT_SCALE, BODY_SIZE]);
+        let one_width = text_width_pt(&fonts.sans_regular, "One", BODY_SIZE);
+        let mark_width = text_width_pt(&fonts.sans_regular, "12", BODY_SIZE * SUPERSCRIPT_SCALE);
+        let space = text_width_pt(&fonts.sans_regular, " ", BODY_SIZE);
+        assert!((runs[1].1 - (runs[0].1 + one_width)).abs() < 0.01);
+        assert!(runs[1].2 > runs[0].2);
+        assert!((runs[2].1 - (runs[1].1 + mark_width + space)).abs() < 0.01);
     }
 
     #[test]
