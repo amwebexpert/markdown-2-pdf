@@ -1,5 +1,6 @@
-//! wasm-bindgen entry point. [`markdown_to_pdf`] and [`pdf_to_markdown`] are
-//! plain in-memory calls usable from any JS context (main thread, worker).
+//! wasm-bindgen entry point. [`markdown_to_pdf`], [`markdown_to_pdf_with_images`]
+//! and [`pdf_to_markdown`] are plain in-memory calls usable from any JS context
+//! (main thread, worker).
 //! [`convert`] must run inside a Web Worker: OPFS's synchronous access handle
 //! (`createSyncAccessHandle`) is only available there, which is why this
 //! module exists separately from `md2pdf-core` — it's the only place
@@ -9,6 +10,8 @@
 //! is Promise-based even in the "sync" OPFS API — only the actual read/write/
 //! flush/close calls on the acquired handle are synchronous. So `convert`
 //! is `async`, but the file I/O itself is a direct, non-awaited call.
+
+use std::collections::BTreeMap;
 
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
@@ -34,6 +37,80 @@ pub fn markdown_to_pdf(markdown: &str) -> Result<Vec<u8>, JsValue> {
     md2pdf_core::convert(markdown)
         .map(|(pdf_bytes, _page_count)| pdf_bytes)
         .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Result of [`markdown_to_pdf_with_images`].
+#[wasm_bindgen(getter_with_clone)]
+#[derive(Debug)]
+pub struct MarkdownToPdfResult {
+    /// The PDF file bytes.
+    pub pdf: Vec<u8>,
+    /// Number of pages produced.
+    #[wasm_bindgen(js_name = pageCount)]
+    pub page_count: usize,
+    /// Content rendered with a fallback, e.g. an image that was not supplied.
+    pub warnings: Vec<String>,
+}
+
+/// Image URLs a document embeds (images alone in their paragraph), in
+/// document order. Fetch or read these, then pass the bytes to
+/// [`markdown_to_pdf_with_images`].
+#[wasm_bindgen(js_name = markdownImageSources)]
+#[must_use]
+pub fn markdown_image_sources(markdown: &str) -> Vec<String> {
+    md2pdf_core::image_sources(markdown)
+}
+
+/// Converts a Markdown string to a PDF, embedding PNG/JPEG images supplied by
+/// the caller: `images` is a `Map<string, Uint8Array>` or a plain object,
+/// keyed by the image URL as written in the Markdown. No file or network
+/// access happens here; anything missing renders as `[image: alt]` and is
+/// listed in `warnings`.
+///
+/// # Errors
+///
+/// Throws if `images` is not a Map/object of `Uint8Array`s, or if the
+/// conversion fails.
+#[wasm_bindgen(js_name = markdownToPdfWithImages)]
+pub fn markdown_to_pdf_with_images(
+    markdown: &str,
+    images: &JsValue,
+) -> Result<MarkdownToPdfResult, JsValue> {
+    let options = md2pdf_core::Options {
+        images: images_from_js(images)?,
+    };
+    let output = md2pdf_core::convert_with_options(markdown, &options)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    Ok(MarkdownToPdfResult {
+        pdf: output.pdf,
+        page_count: output.page_count,
+        warnings: output.warnings,
+    })
+}
+
+fn images_from_js(images: &JsValue) -> Result<BTreeMap<String, Vec<u8>>, JsValue> {
+    let mut out = BTreeMap::new();
+    if images.is_undefined() || images.is_null() {
+        return Ok(out);
+    }
+    let entries: js_sys::Array = match images.dyn_ref::<js_sys::Map>() {
+        Some(map) => js_sys::Array::from(&map.entries()),
+        None if images.is_object() => js_sys::Object::entries(images.unchecked_ref()),
+        None => return Err(JsValue::from_str("images must be a Map or an object")),
+    };
+    for entry in entries.iter() {
+        let entry: js_sys::Array = entry.unchecked_into();
+        let key = entry
+            .get(0)
+            .as_string()
+            .ok_or_else(|| JsValue::from_str("image keys must be strings"))?;
+        let bytes = entry
+            .get(1)
+            .dyn_into::<js_sys::Uint8Array>()
+            .map_err(|_| JsValue::from_str(&format!("image {key}: expected a Uint8Array")))?;
+        out.insert(key, bytes.to_vec());
+    }
+    Ok(out)
 }
 
 /// Result of [`pdf_to_markdown`].
