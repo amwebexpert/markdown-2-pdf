@@ -8,12 +8,15 @@
 use printpdf::{
     Actions, BorderArray, Color, FontId, HighlightingMode, Line, LinePoint, LinkAnnotation, Mm, Op,
     PaintMode, PdfDocument, PdfFontHandle, PdfPage, PdfSaveOptions, Point, Pt, Rect, Rgb, TextItem,
-    TextMatrix,
+    TextMatrix, XObjectId, XObjectTransform,
 };
+
+use std::collections::BTreeMap;
 
 use crate::error::Md2PdfError;
 use crate::fonts::{FontSet, text_width_pt};
-use crate::ir::{Align, Block, ListItem, Span};
+use crate::image::{self, Image};
+use crate::ir::{Align, Block, ImageRef, ListItem, Span};
 
 const PAGE_WIDTH_PT: f32 = 612.0; // US Letter, 8.5in
 const PAGE_HEIGHT_PT: f32 = 792.0; // 11in
@@ -48,6 +51,11 @@ const CHECKBOX_SIZE: f32 = 0.7;
 /// fractions of the surrounding text size.
 const SUPERSCRIPT_SCALE: f32 = 0.7;
 const SUPERSCRIPT_RISE: f32 = 0.35;
+/// Images are laid out at 96 dpi (1 px = 0.75 pt), the CSS reference pixel.
+const PT_PER_PX: f32 = 0.75;
+const CAPTION_SIZE: f32 = 9.0;
+const CAPTION_LEADING: f32 = 12.0;
+const CAPTION_GAP: f32 = 2.0;
 const LINK_COLOR: (f32, f32, f32) = (0.06, 0.32, 0.78);
 const BLACK: (f32, f32, f32) = (0.0, 0.0, 0.0);
 const RULE_GREY: (f32, f32, f32) = (0.7, 0.7, 0.7);
@@ -103,6 +111,10 @@ impl TextStyle {
 
 /// A run of one style inside a word.
 #[derive(Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent inline styles that combine freely, as in Markdown"
+)]
 struct Fragment {
     text: String,
     bold: bool,
@@ -413,7 +425,23 @@ struct FontIds {
     mono_bold_italic: FontId,
 }
 
-struct Renderer {
+/// Image bytes supplied by the caller, keyed by the URL as written in the
+/// Markdown. The renderer never reads files or fetches URLs itself.
+pub type Images = BTreeMap<String, Vec<u8>>;
+
+/// An image already added to the document: its `XObject` and natural size.
+#[derive(Clone)]
+struct Placed {
+    id: XObjectId,
+    width_px: f32,
+    height_px: f32,
+}
+
+struct Renderer<'a> {
+    images: &'a Images,
+    /// Decoded images by source; `None` when the source failed (already warned).
+    placed: BTreeMap<String, Option<Placed>>,
+    warnings: Vec<String>,
     doc: PdfDocument,
     fonts: FontSet,
     font_ids: FontIds,
@@ -423,8 +451,8 @@ struct Renderer {
     cursor_top: f32,
 }
 
-impl Renderer {
-    fn new() -> Result<Self, Md2PdfError> {
+impl<'a> Renderer<'a> {
+    fn new(images: &'a Images) -> Result<Self, Md2PdfError> {
         let fonts = FontSet::load()?;
         let mut doc = PdfDocument::new("Markdown to PDF");
         let font_ids = FontIds {
@@ -438,6 +466,9 @@ impl Renderer {
             mono_bold_italic: doc.add_font(&fonts.mono_bold_italic),
         };
         Ok(Renderer {
+            images,
+            placed: BTreeMap::new(),
+            warnings: Vec::new(),
             doc,
             fonts,
             font_ids,
@@ -617,6 +648,7 @@ impl Renderer {
                 rows,
             } => self.render_table(alignments, header, rows, x0),
             Block::ThematicBreak => self.render_rule(x0, max_width),
+            Block::Image { src, alt, title } => self.render_image(src, alt, title, x0, max_width),
         }
     }
 
@@ -632,6 +664,16 @@ impl Renderer {
         let tokens = tokenize(spans, &self.fonts, size, force_bold);
         let tokens = split_oversized_words(tokens, &self.fonts, size, max_width);
         wrap_lines(tokens, max_width, space_width)
+    }
+
+    /// Italic `[image: alt]` paragraph standing in for an image that can't
+    /// be embedded.
+    fn render_image_fallback(&mut self, alt: &str, x0: f32, max_width: f32) {
+        let span = Span {
+            italic: true,
+            ..Span::image_fallback(alt, ImageRef::default())
+        };
+        self.render_paragraph(&[span], x0, max_width);
     }
 
     fn render_heading(&mut self, level: u8, spans: &[Span], x0: f32, max_width: f32) {
@@ -951,7 +993,92 @@ impl Renderer {
         }
     }
 
-    fn finish(mut self) -> (Vec<u8>, usize) {
+    /// Decodes and embeds `src` on first use; later uses share the `XObject`.
+    /// Warns once and returns `None` when the image is missing or unusable.
+    fn place_image(&mut self, src: &str) -> Option<Placed> {
+        if let Some(placed) = self.placed.get(src) {
+            return placed.clone();
+        }
+        let decoded = match self.images.get(src) {
+            None => Err("image not found".to_string()),
+            Some(bytes) => image::decode(bytes),
+        };
+        let placed = match decoded {
+            Ok(decoded) => {
+                let (width, height) = decoded.size_px();
+                let id = match decoded {
+                    Image::Raw(raw) => self.doc.add_image(&raw),
+                    Image::Jpeg(jpeg) => self.doc.add_xobject(&jpeg),
+                };
+                Some(Placed {
+                    id,
+                    width_px: width as f32,
+                    height_px: height as f32,
+                })
+            }
+            Err(reason) => {
+                self.warnings.push(format!("image {src}: {reason}"));
+                None
+            }
+        };
+        self.placed.insert(src.to_string(), placed.clone());
+        placed
+    }
+
+    fn render_image(&mut self, src: &str, alt: &str, title: &str, x0: f32, max_width: f32) {
+        let Some(placed) = self.place_image(src) else {
+            self.render_image_fallback(alt, x0, max_width);
+            return;
+        };
+        let caption = if title.is_empty() {
+            Vec::new()
+        } else {
+            let span = Span {
+                italic: true,
+                ..Span::plain(title)
+            };
+            self.wrap_spans_to_lines(
+                &[span],
+                max_width,
+                CAPTION_SIZE,
+                false,
+                &self.fonts.sans_italic,
+            )
+        };
+        let caption_height = caption.len() as f32 * CAPTION_LEADING;
+        let printable_height = PAGE_HEIGHT_PT - 2.0 * MARGIN_PT;
+        // Never upscale; keep the caption on the image's page.
+        let scale = (PT_PER_PX)
+            .min(max_width / placed.width_px)
+            .min(((printable_height - caption_height) / placed.height_px).max(0.0));
+        let height = placed.height_px * scale;
+        if self.cursor_top > MARGIN_PT
+            && self.cursor_top + height + caption_height > PAGE_HEIGHT_PT - MARGIN_PT
+        {
+            self.new_page();
+        }
+        self.cursor_top += height;
+        self.ops.push(Op::UseXobject {
+            id: placed.id,
+            transform: XObjectTransform {
+                translate_x: Some(Pt(x0)),
+                translate_y: Some(Pt(PAGE_HEIGHT_PT - self.cursor_top)),
+                scale_x: Some(scale),
+                scale_y: Some(scale),
+                // 1 px = 1 pt before scaling.
+                dpi: Some(72.0),
+                ..Default::default()
+            },
+        });
+        self.cursor_top += CAPTION_GAP;
+        for line in &caption {
+            let y = self.next_baseline(CAPTION_LEADING);
+            self.render_line(line, x0, y, CAPTION_SIZE);
+        }
+        self.cursor_top += PARAGRAPH_SPACING_AFTER;
+    }
+
+    fn finish(mut self) -> (Vec<u8>, usize, Vec<String>) {
         self.pages.push(PdfPage::new(
             Mm::from(Pt(PAGE_WIDTH_PT)),
             Mm::from(Pt(PAGE_HEIGHT_PT)),
@@ -961,13 +1088,17 @@ impl Renderer {
         self.doc.pages = self.pages;
         let mut warnings = Vec::new();
         let bytes = self.doc.save(&PdfSaveOptions::default(), &mut warnings);
-        (bytes, page_count)
+        (bytes, page_count, self.warnings)
     }
 }
 
-/// Returns the generated PDF bytes and the number of pages produced.
-pub fn render(blocks: &[Block]) -> Result<(Vec<u8>, usize), Md2PdfError> {
-    let mut renderer = Renderer::new()?;
+/// Returns the generated PDF bytes, the number of pages produced and the
+/// warnings about content that had to fall back (missing images, …).
+pub fn render(
+    blocks: &[Block],
+    images: &Images,
+) -> Result<(Vec<u8>, usize, Vec<String>), Md2PdfError> {
+    let mut renderer = Renderer::new(images)?;
     for block in blocks {
         renderer.render_block(block, MARGIN_PT);
     }
@@ -1068,7 +1199,8 @@ mod tests {
 
     #[test]
     fn long_unbreakable_heading_token_wraps_instead_of_overflowing() {
-        let renderer = Renderer::new().unwrap();
+        let images = Images::new();
+        let renderer = Renderer::new(&images).unwrap();
         let long_token = "src/features/Configuration/report_templates/ReportTemplateEditor.tsx";
         let max_width = 200.0;
         let lines = renderer.wrap_spans_to_lines(
@@ -1085,14 +1217,35 @@ mod tests {
         }
     }
 
-    fn rendered_ops(blocks: &[Block]) -> Vec<Op> {
-        let mut renderer = Renderer::new().unwrap();
+    struct Rendered {
+        /// Ops of each page, the last one still open.
+        pages: Vec<Vec<Op>>,
+        warnings: Vec<String>,
+        xobjects: usize,
+    }
+
+    impl Rendered {
+        fn ops(&self) -> Vec<Op> {
+            self.pages.concat()
+        }
+    }
+
+    fn render_with(blocks: &[Block], images: &Images) -> Rendered {
+        let mut renderer = Renderer::new(images).unwrap();
         for block in blocks {
             renderer.render_block(block, MARGIN_PT);
         }
-        let mut ops: Vec<Op> = renderer.pages.iter().flat_map(|p| p.ops.clone()).collect();
-        ops.extend(renderer.ops);
-        ops
+        let mut pages: Vec<Vec<Op>> = renderer.pages.iter().map(|p| p.ops.clone()).collect();
+        pages.push(renderer.ops);
+        Rendered {
+            pages,
+            warnings: renderer.warnings,
+            xobjects: renderer.doc.resources.xobjects.map.len(),
+        }
+    }
+
+    fn rendered_ops(blocks: &[Block]) -> Vec<Op> {
+        render_with(blocks, &Images::new()).ops()
     }
 
     /// `(text, x, y)` of every text run, in drawing order.
@@ -1261,6 +1414,120 @@ mod tests {
         assert!((runs[2].1 - (runs[1].1 + mark_width + space)).abs() < 0.01);
     }
 
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, width, height);
+            encoder.set_color(png::ColorType::Grayscale);
+            let mut writer = encoder.write_header().unwrap();
+            let pixels = vec![128; (width * height) as usize];
+            writer.write_image_data(&pixels).unwrap();
+        }
+        out
+    }
+
+    fn image(src: &str, title: &str) -> Block {
+        Block::Image {
+            src: src.into(),
+            alt: "the alt".into(),
+            title: title.into(),
+        }
+    }
+
+    /// `(x, y, scale_x, scale_y)` of every placed `XObject`.
+    fn placements(ops: &[Op]) -> Vec<(f32, f32, f32, f32)> {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::UseXobject { transform, .. } => Some((
+                    transform.translate_x.unwrap().0,
+                    transform.translate_y.unwrap().0,
+                    transform.scale_x.unwrap(),
+                    transform.scale_y.unwrap(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn image_is_drawn_at_96_dpi_below_the_cursor() {
+        let images = Images::from([("a.png".to_string(), png_bytes(200, 100))]);
+        let rendered = render_with(&[image("a.png", "")], &images);
+        assert!(rendered.warnings.is_empty(), "{:?}", rendered.warnings);
+        let placed = placements(&rendered.ops());
+        assert_eq!(placed.len(), 1);
+        let (x, y, sx, sy) = placed[0];
+        // 200 × 100 px at 96 dpi = 150 × 75 pt, with 1 px = 1 pt before scaling.
+        assert!((sx * 200.0 - 150.0).abs() < 0.01 && (sy * 100.0 - 75.0).abs() < 0.01);
+        assert!((x - MARGIN_PT).abs() < 0.01);
+        assert!(y < PAGE_HEIGHT_PT - MARGIN_PT - 75.0 + 0.01);
+    }
+
+    #[test]
+    fn wide_image_shrinks_to_the_content_width_keeping_aspect_ratio() {
+        let images = Images::from([("w.png".to_string(), png_bytes(2000, 500))]);
+        let ops = render_with(&[image("w.png", "")], &images).ops();
+        let (_, _, sx, sy) = placements(&ops)[0];
+        let content_width = PAGE_WIDTH_PT - 2.0 * MARGIN_PT;
+        assert!((sx * 2000.0 - content_width).abs() < 0.01);
+        assert!((sx - sy).abs() < 1e-6, "aspect ratio kept");
+    }
+
+    #[test]
+    fn tall_image_shrinks_to_the_printable_height() {
+        let images = Images::from([("t.png".to_string(), png_bytes(100, 3000))]);
+        let ops = render_with(&[image("t.png", "")], &images).ops();
+        let (_, y, _, sy) = placements(&ops)[0];
+        assert!((sy * 3000.0 - (PAGE_HEIGHT_PT - 2.0 * MARGIN_PT)).abs() < 0.01);
+        assert!((y - MARGIN_PT).abs() < 0.01);
+    }
+
+    #[test]
+    fn image_that_does_not_fit_starts_a_new_page() {
+        let images = Images::from([("a.png".to_string(), png_bytes(400, 600))]);
+        let filler: Vec<Block> = (0..30)
+            .map(|_| paragraph(vec![Span::plain("line")]))
+            .collect();
+        let mut blocks = filler;
+        blocks.push(image("a.png", ""));
+        let rendered = render_with(&blocks, &images);
+        assert_eq!(rendered.pages.len(), 2);
+        assert!(placements(&rendered.pages[0]).is_empty());
+        assert_eq!(placements(&rendered.pages[1]).len(), 1);
+    }
+
+    #[test]
+    fn title_becomes_a_caption_under_the_image() {
+        let images = Images::from([("a.png".to_string(), png_bytes(200, 100))]);
+        let ops = render_with(&[image("a.png", "Figure one")], &images).ops();
+        let (_, image_bottom, _, _) = placements(&ops)[0];
+        let runs = text_runs(&ops);
+        let texts: Vec<&str> = runs.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(texts, ["Figure", "one"]);
+        assert!(runs[0].2 < image_bottom);
+    }
+
+    #[test]
+    fn repeated_image_is_embedded_once() {
+        let images = Images::from([("a.png".to_string(), png_bytes(10, 10))]);
+        let rendered = render_with(&[image("a.png", ""), image("a.png", "")], &images);
+        assert_eq!(placements(&rendered.ops()).len(), 2);
+        assert_eq!(rendered.xobjects, 1);
+    }
+
+    #[test]
+    fn missing_or_broken_image_falls_back_to_alt_text_with_a_warning() {
+        let images = Images::from([("bad.png".to_string(), b"not an image".to_vec())]);
+        let rendered = render_with(&[image("missing.png", ""), image("bad.png", "")], &images);
+        let ops = rendered.ops();
+        assert!(placements(&ops).is_empty());
+        let texts: Vec<String> = text_runs(&ops).into_iter().map(|r| r.0).collect();
+        assert_eq!(texts, ["[image:", "the", "alt]", "[image:", "the", "alt]"]);
+        assert_eq!(rendered.warnings.len(), 2);
+        assert!(rendered.warnings[0].contains("missing.png"));
+        assert!(rendered.warnings[1].contains("bad.png"));
+    }
+
     #[test]
     fn render_produces_a_single_page_pdf() {
         let blocks = vec![
@@ -1272,7 +1539,7 @@ mod tests {
                 spans: vec![Span::plain("Body text.")],
             },
         ];
-        let (bytes, page_count) = render(&blocks).unwrap();
+        let (bytes, page_count, _) = render(&blocks, &Images::new()).unwrap();
         assert_eq!(page_count, 1);
         assert!(bytes.starts_with(b"%PDF"));
     }

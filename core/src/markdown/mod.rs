@@ -57,9 +57,30 @@ pub fn parse(input: &str) -> Vec<Block> {
     blocks
 }
 
+/// Sources of the image blocks, deduplicated, in document order.
+pub fn image_sources(blocks: &[Block]) -> Vec<String> {
+    fn walk(blocks: &[Block], out: &mut Vec<String>) {
+        for block in blocks {
+            match block {
+                Block::Image { src, .. } if !out.contains(src) => out.push(src.clone()),
+                Block::BlockQuote(inner) => walk(inner, out),
+                Block::List { items, .. } => {
+                    for item in items {
+                        walk(&item.blocks, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(blocks, &mut out);
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse;
+    use super::{image_sources, parse};
     use crate::ir::{Align, Block, Span};
 
     fn span_text(spans: &[Span]) -> String {
@@ -128,12 +149,57 @@ mod tests {
     }
 
     #[test]
-    fn image_becomes_bracketed_alt_text() {
-        let blocks = parse("![alt text](http://example.com/x.png)");
+    fn image_alone_in_a_paragraph_becomes_an_image_block() {
+        let blocks = parse("![alt text](img/x.png \"The title\")");
+        assert_eq!(
+            blocks,
+            vec![Block::Image {
+                src: "img/x.png".into(),
+                alt: "alt text".into(),
+                title: "The title".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn consecutive_images_each_become_a_block() {
+        let blocks = parse("![a](a.png)\n![b](b.jpg)");
+        let srcs: Vec<&str> = blocks
+            .iter()
+            .map(|b| match b {
+                Block::Image { src, .. } => src.as_str(),
+                other => panic!("expected images, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(srcs, ["a.png", "b.jpg"]);
+    }
+
+    #[test]
+    fn image_inside_running_text_keeps_the_alt_text_fallback() {
+        let blocks = parse("see ![alt text](http://example.com/x.png) here");
         match blocks.as_slice() {
-            [Block::Paragraph { spans }] => assert_eq!(span_text(spans), "[image: alt text]"),
+            [Block::Paragraph { spans }] => {
+                assert_eq!(span_text(spans), "see [image: alt text] here");
+            }
             other => panic!("expected one paragraph, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn image_in_a_tight_list_item_becomes_an_image_block() {
+        let blocks = parse("- ![a](a.png)\n");
+        match blocks.as_slice() {
+            [Block::List { items, .. }] => {
+                assert!(matches!(items[0].blocks.as_slice(), [Block::Image { .. }]));
+            }
+            other => panic!("expected one list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_sources_lists_block_images_once_in_document_order() {
+        let md = "![a](a.png)\n\n> ![b](b.png)\n\n- ![a](a.png)\n\ntext ![c](c.png) text\n";
+        assert_eq!(image_sources(&parse(md)), ["a.png", "b.png"]);
     }
 
     #[test]
@@ -424,7 +490,7 @@ mod tests {
     fn image_alt_includes_inline_code_text() {
         let blocks = parse("![a `b` c](x.png)");
         match blocks.as_slice() {
-            [Block::Paragraph { spans }] => assert_eq!(span_text(spans), "[image: a b c]"),
+            [Block::Image { alt, .. }] => assert_eq!(alt, "a b c"),
             other => panic!("expected one paragraph, got {other:?}"),
         }
     }

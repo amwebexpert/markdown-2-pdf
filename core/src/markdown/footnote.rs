@@ -22,12 +22,11 @@ fn normalize(label: &str) -> String {
 impl Footnotes {
     pub(super) fn reference(&mut self, label: &str) -> Span {
         let label = normalize(label);
-        let index = match self.referenced.iter().position(|l| *l == label) {
-            Some(index) => index,
-            None => {
-                self.referenced.push(label);
-                self.referenced.len() - 1
-            }
+        let index = if let Some(index) = self.referenced.iter().position(|l| *l == label) {
+            index
+        } else {
+            self.referenced.push(label);
+            self.referenced.len() - 1
         };
         Span {
             text: (index + 1).to_string(),

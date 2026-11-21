@@ -20,7 +20,9 @@ pub(super) fn open_tag(stack: &mut Vec<Frame>, tag: Tag<'_>) {
         Tag::Strong => open_strong(stack),
         Tag::Strikethrough => open_strikethrough(stack),
         Tag::Link { dest_url, .. } => open_link(stack, dest_url.into_string()),
-        Tag::Image { .. } => open_image(stack),
+        Tag::Image {
+            dest_url, title, ..
+        } => open_image(stack, dest_url.into_string(), title.into_string()),
         Tag::HtmlBlock => open_html_block(stack),
         _ => {}
     }
@@ -94,8 +96,12 @@ fn open_link(stack: &mut Vec<Frame>, url: String) {
     });
 }
 
-fn open_image(stack: &mut Vec<Frame>) {
-    stack.push(Frame::Image { alt: String::new() });
+fn open_image(stack: &mut Vec<Frame>, src: String, title: String) {
+    stack.push(Frame::Image {
+        src,
+        title,
+        alt: String::new(),
+    });
 }
 
 fn open_html_block(stack: &mut Vec<Frame>) {

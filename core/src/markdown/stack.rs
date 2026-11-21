@@ -1,6 +1,6 @@
 //! Stack mutations shared by event handling (text, blocks, implicit paragraphs).
 
-use crate::ir::{Block, Span};
+use crate::ir::{Block, ImageRef, Span};
 
 use super::frame::Frame;
 
@@ -8,7 +8,27 @@ pub(super) fn flush_dangling_paragraph(stack: &mut Vec<Frame>) {
     if matches!(stack.last(), Some(Frame::Paragraph(_)))
         && let Some(Frame::Paragraph(spans)) = stack.pop()
     {
+        push_paragraph(stack, spans);
+    }
+}
+
+/// Pushes a finished paragraph. One holding nothing but images (and
+/// whitespace) becomes one [`Block::Image`] per image instead; an image mixed
+/// with text keeps its `[image: alt]` fallback span.
+pub(super) fn push_paragraph(stack: &mut [Frame], spans: Vec<Span>) {
+    let only_images = spans.iter().any(|s| s.image.is_some())
+        && spans
+            .iter()
+            .all(|s| s.image.is_some() || s.text.trim().is_empty());
+    if !only_images {
         push_block(stack, Block::Paragraph { spans });
+        return;
+    }
+    for span in spans {
+        let alt = span.alt_text();
+        if let Some(ImageRef { src, title }) = span.image {
+            push_block(stack, Block::Image { src, alt, title });
+        }
     }
 }
 
@@ -57,14 +77,14 @@ pub(super) fn push_block(stack: &mut [Frame], block: Block) {
 pub(super) fn push_text(stack: &mut Vec<Frame>, text: &str) {
     match stack.last_mut() {
         Some(Frame::CodeBlock(buf) | Frame::HtmlBlock(buf)) => buf.push_str(text),
-        Some(Frame::Image { alt }) => alt.push_str(text),
+        Some(Frame::Image { alt, .. }) => alt.push_str(text),
         _ => push_span(stack, Span::plain(text.to_string())),
     }
 }
 
 pub(super) fn push_code(stack: &mut Vec<Frame>, text: &str) {
     match stack.last_mut() {
-        Some(Frame::Image { alt }) => alt.push_str(text),
+        Some(Frame::Image { alt, .. }) => alt.push_str(text),
         _ => push_span(
             stack,
             Span {

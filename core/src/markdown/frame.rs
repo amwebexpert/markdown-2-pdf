@@ -25,6 +25,8 @@ pub(super) enum Frame {
         spans: Vec<Span>,
     },
     Image {
+        src: String,
+        title: String,
         alt: String,
     },
     Table {

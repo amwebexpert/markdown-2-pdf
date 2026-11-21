@@ -2,12 +2,12 @@
 
 use pulldown_cmark::{HeadingLevel, TagEnd};
 
-use crate::ir::{Block, ListItem, Span};
+use crate::ir::{Block, ImageRef, ListItem, Span};
 
 use super::align::heading_level;
 use super::frame::Frame;
 use super::html::is_html_comment;
-use super::stack::{extend_spans, push_block, push_span};
+use super::stack::{extend_spans, push_block, push_paragraph, push_span};
 
 pub(super) fn close_tag(stack: &mut Vec<Frame>, tag_end: TagEnd) {
     match tag_end {
@@ -32,7 +32,7 @@ pub(super) fn close_tag(stack: &mut Vec<Frame>, tag_end: TagEnd) {
 
 fn close_paragraph(stack: &mut Vec<Frame>) {
     if let Some(Frame::Paragraph(spans)) = stack.pop() {
-        push_block(stack, Block::Paragraph { spans });
+        push_paragraph(stack, spans);
     }
 }
 
@@ -159,8 +159,8 @@ fn close_link(stack: &mut Vec<Frame>) {
 }
 
 fn close_image(stack: &mut Vec<Frame>) {
-    if let Some(Frame::Image { alt }) = stack.pop() {
-        push_span(stack, Span::plain(format!("[image: {alt}]")));
+    if let Some(Frame::Image { src, title, alt }) = stack.pop() {
+        push_span(stack, Span::image_fallback(&alt, ImageRef { src, title }));
     }
 }
 
