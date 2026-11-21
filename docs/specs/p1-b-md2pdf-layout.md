@@ -1,7 +1,34 @@
 # md2pdf — P1-B spec: layout and pagination
 
-Status: ready · Source: `improvements.md` §5 · Depends on: P1-C (fragment
-words) · One PR.
+Status: implemented · Source: `improvements.md` §5 · Depends on: P1-C
+(fragment words) · One PR (`feat/md2pdf-layout`).
+
+## As built
+
+- Goals 1–8 implemented in `core/src/render/` (sizing in `render/table.rs`).
+- Design deviation: no `LineBox` type. Measurement already happens before
+  drawing for paragraphs and tables; look-ahead uses `keep_together`,
+  `paragraph_break` and `RowLayout`. Per-page decorations (code background,
+  quote bar) are inserted afterwards via a `Mark` + `decorate`.
+- Small tables no longer move whole to the next page: every table paginates
+  row by row (header kept with the first row and repeated), which avoids the
+  large blank areas the old keep-together caused.
+- A header taller than half the printable height is drawn once (split like
+  a tall row) instead of being repeated, so a continuation page always has
+  room for body rows. Goal 3's repetition applies to every other header.
+- Keep-with-next looks at the following block: a table keeps its header +
+  first row line, an image its full height + caption, anything else two
+  body lines. The demand is capped at half a page so a heading never ends up
+  alone. Known limit: a heading followed by an image taller than half a page
+  can still be separated from it.
+- Widow/orphan control applies to every break of a paragraph and to list
+  item paragraphs too.
+- Deep nesting stops indenting once 144 pt of content width is left, so
+  content never runs off the page.
+- Also fixed (found in the P1-C review): a list item starting with a
+  non-paragraph block drew its marker on a reserved line that could be
+  stranded on the previous page; the marker now sits on the block's first
+  line.
 
 ## Context (current renderer, `core/src/render.rs`)
 

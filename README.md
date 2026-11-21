@@ -99,7 +99,7 @@ From the repo root, run `just` to list recipes. Common entry points:
 
 See [`cli/examples/`](cli/examples/) for inputs (`simple.md`, `kitchen-sink.md` — core
 constructs, `features.md` — strikethrough, task lists, images, footnotes and raw
-HTML, `nested-and-long.md` — nested lists and multi-page pagination). Example
+HTML, `layout.md` — table sizing and multi-page tables and code, `nested-and-long.md` — nested lists and multi-page pagination). Example
 PDFs are not committed; see [`.gitignore`](.gitignore).
 
 ## PDF → Markdown (pdf2md)
@@ -253,15 +253,21 @@ Production static output: `just demo-build`.
   | Task lists `- [ ]` / `- [x]` | Vector checkbox in the marker slot. |
   | Strikethrough `~~x~~` | A line through the text; combines with other styles. |
   | Links | Text + a clickable PDF annotation. |
-  | Code blocks | Monospace, no syntax highlighting. |
-  | GFM tables | Content-sized columns, alignment. |
-  | Blockquotes, thematic breaks | Indented / horizontal rule. |
+  | Code blocks | Monospace on a light background, no syntax highlighting. |
+  | GFM tables | Columns sized from content (a column keeps its longest word whole; slack goes to columns that want more), alignment, header repeated on every page, rows never split unless taller than a page (then cut between lines). |
+  | Blockquotes, thematic breaks | Indented with a side bar / horizontal rule. |
   | Images alone in a paragraph | PNG/JPEG embedded at 96 dpi, shrunk to fit the page (aspect kept), title as caption; otherwise `[image: alt]` + a warning. Images inside running text stay `[image: alt]`. |
   | Footnotes `[^a]` | Superscript numbers; notes listed as **endnotes** after the body (not at the page bottom). |
   | Raw HTML | Never interpreted: blocks shown verbatim in code style, inline tags kept as text, `<br>` breaks the line, comments dropped. |
   | Math `$…$`, definition lists, super/subscript, wiki links | Not parsed: the source text is printed as written. |
 
   Unsupported syntax never fails the conversion; it falls back to its text.
+- Pagination: headings are kept with the first lines of their section,
+  paragraphs of 4+ lines keep at least 2 lines on each side of a page break,
+  code blocks and blockquotes split line by line (background / bar drawn per
+  page), and spacing before a block is dropped at the top of a page. Text is
+  left-aligned without hyphenation, kerning or font fallback (glyphs missing
+  from Liberation Sans/Mono, e.g. CJK, are not rendered).
 - Unit test coverage is minimal (parser, layout helpers, entry points in
   `core/`) — run with `just test` (or `cargo test --workspace`). Beyond that,
   verify manually with `just examples` or `just demo`.
