@@ -1,7 +1,22 @@
 # md2pdf — P1-B spec: layout and pagination
 
-Status: ready · Source: `improvements.md` §5 · Depends on: P1-C (fragment
-words) · One PR.
+Status: implemented · Source: `improvements.md` §5 · Depends on: P1-C
+(fragment words) · One PR (`feat/md2pdf-layout`).
+
+## As built
+
+- Goals 1–8 implemented in `core/src/render/` (sizing in `render/table.rs`).
+- Design deviation: no `LineBox` type. Measurement already happens before
+  drawing for paragraphs and tables; look-ahead uses `keep_together`,
+  `paragraph_break` and `RowLayout`. Per-page decorations (code background,
+  quote bar) are inserted afterwards via a `Mark` + `decorate`.
+- Small tables no longer move whole to the next page: every table paginates
+  row by row (header kept with the first row and repeated), which avoids the
+  large blank areas the old keep-together caused.
+- Also fixed (found in the P1-C review): a list item starting with a
+  non-paragraph block drew its marker on a reserved line that could be
+  stranded on the previous page; the marker now sits on the block's first
+  line.
 
 ## Context (current renderer, `core/src/render.rs`)
 
