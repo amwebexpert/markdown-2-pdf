@@ -41,6 +41,9 @@ const SAME_EXTENT: f32 = 3.0;
 const MIN_GRID_FILL: f32 = 0.3;
 /// Smallest share of non-empty cells for an alignment table.
 const MIN_ALIGNED_FILL: f32 = 0.6;
+/// A sparse candidate this close to `MIN_ALIGNED_FILL` (share of it) is a
+/// near miss, reported as ambiguous.
+const NEAR_MISS_SHARE: f32 = 0.8;
 /// Gap between glyphs (in font sizes) that separates words.
 const WORD_GAP: f32 = 0.15;
 
@@ -527,7 +530,7 @@ fn booktabs(rules: Vec<Ruling>, glyphs: &mut Vec<Glyph>) -> (Vec<Table>, Vec<Rul
         // Columns set too tightly for a shared gap: follow the header words.
         let header_guided = || {
             (!other_aligned_text(&rows))
-                .then(|| table_from_gaps(&rows, &header_gaps(&rows, misses), false))
+                .then(|| table_from_gaps(&rows, &header_gaps(&rows, misses), false).ok())
                 .flatten()
         };
         let best = match aligned(&rows, 0.8, misses, false) {
@@ -660,15 +663,77 @@ fn other_aligned_text(rows: &[Vec<Piece>]) -> bool {
 /// but `misses` of them split them into ≥ 2 columns. `merge` folds wrapped
 /// rows together and then requires ≥ 3 rows.
 pub fn aligned(rows: &[Vec<Piece>], min_gap: f32, misses: usize, merge: bool) -> Option<Table> {
-    if rows.len() < 2 || other_aligned_text(rows) {
-        return None;
+    verdict(rows, min_gap, misses, merge).ok()
+}
+
+/// Why aligned text was not taken for a table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rejected {
+    /// Too few rows, or no x range empty in (almost) every row.
+    NoColumns,
+    /// A list with wide gaps after its markers, or code.
+    OtherText,
+    /// Equations with their numbers in a right-hand column.
+    Equations,
+    /// Columns line up but too few cells have text (within 20% of the
+    /// threshold): a near miss worth reporting.
+    Sparse,
+    /// Columns line up but most cells are empty.
+    Scattered,
+}
+
+impl Rejected {
+    /// A near miss: reported so a missed table doesn't go unnoticed.
+    pub fn is_ambiguous(self) -> bool {
+        self == Rejected::Sparse
+    }
+}
+
+/// [`aligned`], saying why when the rows are not taken for a table.
+pub fn verdict(
+    rows: &[Vec<Piece>],
+    min_gap: f32,
+    misses: usize,
+    merge: bool,
+) -> Result<Table, Rejected> {
+    if rows.len() < 2 {
+        return Err(Rejected::NoColumns);
+    }
+    if other_aligned_text(rows) {
+        return Err(Rejected::OtherText);
     }
     let pieces = rows.iter().flatten();
-    let left = pieces.clone().map(|p| p.x0).reduce(f32::min)?;
-    let right = pieces.map(|p| p.x1).reduce(f32::max)?;
-    let size = median_size(rows)?;
+    let left = pieces.clone().map(|p| p.x0).reduce(f32::min);
+    let right = pieces.map(|p| p.x1).reduce(f32::max);
+    let (Some(left), Some(right), Some(size)) = (left, right, median_size(rows)) else {
+        return Err(Rejected::NoColumns);
+    };
     let gaps = shared_gaps(rows, left, right, min_gap * size, misses);
-    table_from_gaps(rows, &gaps, merge)
+    let table = table_from_gaps(rows, &gaps, merge)?;
+    if numbered_equations(&table) {
+        return Err(Rejected::Equations);
+    }
+    Ok(table)
+}
+
+/// Every filled cell of the last column is an equation number: `(1)`, `(2a)`.
+fn numbered_equations(table: &Table) -> bool {
+    let numbers: Vec<String> = table
+        .rows
+        .iter()
+        .filter_map(|row| row.last())
+        .map(|cell| cell.iter().flatten().map(|g| g.text.as_str()).collect())
+        .filter(|text: &String| !text.is_empty())
+        .collect();
+    !numbers.is_empty()
+        && numbers.iter().all(|text| {
+            text.strip_prefix('(')
+                .and_then(|t| t.strip_suffix(')'))
+                .is_some_and(|n| {
+                    n.chars().next().is_some_and(|c| c.is_ascii_digit())
+                        && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '.')
+                })
+        })
 }
 
 /// Median glyph size of the rows.
@@ -741,13 +806,21 @@ fn header_gaps(rows: &[Vec<Piece>], misses: usize) -> Vec<(f32, f32)> {
 /// Builds the table for columns split at `gaps`; `None` when there is no
 /// gap or the table shape is too sparse. `merge` folds wrapped rows together
 /// and then requires ≥ 3 rows.
-fn table_from_gaps(rows: &[Vec<Piece>], gaps: &[(f32, f32)], merge: bool) -> Option<Table> {
-    if gaps.is_empty() {
-        return None;
-    }
+fn table_from_gaps(
+    rows: &[Vec<Piece>],
+    gaps: &[(f32, f32)],
+    merge: bool,
+) -> Result<Table, Rejected> {
     let pieces = rows.iter().flatten();
-    let left = pieces.clone().map(|p| p.x0).reduce(f32::min)?;
-    let right = pieces.clone().map(|p| p.x1).reduce(f32::max)?;
+    let (Some(left), Some(right)) = (
+        pieces.clone().map(|p| p.x0).reduce(f32::min),
+        pieces.clone().map(|p| p.x1).reduce(f32::max),
+    ) else {
+        return Err(Rejected::NoColumns);
+    };
+    if gaps.is_empty() {
+        return Err(Rejected::NoColumns);
+    }
     let glyphs = pieces.flat_map(|p| &p.glyphs);
     let top = glyphs
         .clone()
@@ -759,13 +832,18 @@ fn table_from_gaps(rows: &[Vec<Piece>], gaps: &[(f32, f32)], merge: bool) -> Opt
     if merge {
         merge_continuations(&mut table_rows, &mut boxes);
         if table_rows.len() < 3 {
-            return None;
+            return Err(Rejected::NoColumns);
         }
     }
     let total = table_rows.len() * cols;
     let filled = boxes.iter().flatten().filter(|e| e.is_some()).count();
-    if (filled as f32) < MIN_ALIGNED_FILL * total as f32 {
-        return None;
+    let fill = filled as f32 / total.max(1) as f32;
+    if fill < MIN_ALIGNED_FILL {
+        return Err(if fill >= NEAR_MISS_SHARE * MIN_ALIGNED_FILL {
+            Rejected::Sparse
+        } else {
+            Rejected::Scattered
+        });
     }
 
     let align = (0..cols)
@@ -789,7 +867,7 @@ fn table_from_gaps(rows: &[Vec<Piece>], gaps: &[(f32, f32)], merge: bool) -> Opt
         .chain(gaps.iter().map(|&(a, b)| f32::midpoint(a, b)))
         .chain(std::iter::once(right))
         .collect();
-    Some(Table {
+    Ok(Table {
         bbox: [left, bottom, right, top],
         columns,
         align,
@@ -1236,6 +1314,35 @@ mod tests {
             true,
         );
         assert!(table.is_none());
+    }
+
+    #[test]
+    fn numbered_equations_are_not_a_table() {
+        let rows = rows(&[
+            &[("x=a+b", 120.0), ("(1)", 400.0)],
+            &[("y=c-d", 120.0), ("(2)", 400.0)],
+            &[("z=x*y", 120.0), ("(3a)", 400.0)],
+        ]);
+        assert!(aligned(&rows, 1.0, 0, true).is_none());
+        assert_eq!(
+            verdict(&rows, 1.0, 0, true).err(),
+            Some(Rejected::Equations)
+        );
+    }
+
+    #[test]
+    fn sparse_aligned_text_is_rejected_as_ambiguous() {
+        // Three columns line up, but only half the cells have text.
+        let rows = rows(&[
+            &[("Name", 72.0), ("Role", 200.0), ("Age", 320.0)],
+            &[("Ada", 72.0)],
+            &[("Grace", 72.0)],
+            &[("Alan", 72.0), ("Math", 200.0)],
+        ]);
+        assert!(aligned(&rows, 1.0, 0, false).is_none());
+        assert_eq!(verdict(&rows, 1.0, 0, false).err(), Some(Rejected::Sparse));
+        assert!(Rejected::Sparse.is_ambiguous());
+        assert!(!Rejected::Equations.is_ambiguous());
     }
 
     #[test]

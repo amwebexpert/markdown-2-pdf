@@ -147,9 +147,9 @@ pub fn convert(pdf: &[u8], options: &Options) -> Result<Output, Pdf2MdError> {
     }
 
     // Furniture detection needs every page at once; failed pages keep their slot.
-    let mut items = layout::items(&extracted, options.keep_headers)
-        .into_iter()
-        .peekable();
+    let (items, layout_warnings) = layout::items(&extracted, options.keep_headers);
+    warnings.extend(layout_warnings);
+    let mut items = items.into_iter().peekable();
     let mut extracted_boxes = extracted.iter().map(|page| page.bbox);
     let page_boxes: Vec<Option<[f32; 4]>> = failed
         .iter()
