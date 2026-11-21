@@ -13,6 +13,10 @@ use printpdf::{
 
 use std::collections::BTreeMap;
 
+mod table;
+
+use table::{Demand, column_widths};
+
 use crate::error::Md2PdfError;
 use crate::fonts::{FontSet, text_width_pt};
 use crate::image::{self, Decoded};
@@ -37,6 +41,8 @@ const TABLE_FONT_SIZE: f32 = 10.0;
 const TABLE_ROW_LEADING: f32 = 13.0;
 const TABLE_CELL_PADDING: f32 = 4.0;
 const TABLE_BORDER_THICKNESS: f32 = 0.6;
+/// Narrowest column content width, so an empty column stays visible.
+const MIN_COLUMN_CONTENT: f32 = 10.0;
 /// Baseline distance below the top of a line box, as a fraction of leading —
 /// an approximation (fonts don't share one ascent ratio) good enough since no
 /// pixel-perfect typography was requested.
@@ -362,39 +368,52 @@ fn split_oversized_words(
     out
 }
 
-fn measure_row_natural(fonts: &FontSet, cells: &[Vec<Span>], widths: &mut [f32]) {
-    let num_cols = widths.len();
-    for (i, spans) in cells.iter().enumerate().take(num_cols) {
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
-        let bold = spans.iter().any(|s| s.bold);
-        let italic = spans.iter().any(|s| s.italic);
-        let code = spans.iter().any(|s| s.code);
-        let font = fonts.resolve(bold, italic, code);
-        let w = text_width_pt(font, &text, TABLE_FONT_SIZE) + TABLE_CELL_PADDING * 2.0;
-        if let Some(width) = widths.get_mut(i) {
-            *width = width.max(w);
+/// Width demand of one cell, measured with the same tokens as wrapping uses
+/// (so per-span fonts, explicit breaks and code all count).
+fn cell_demand(fonts: &FontSet, spans: &[Span], force_bold: bool) -> Demand {
+    let space_width = text_width_pt(&fonts.sans_regular, " ", TABLE_FONT_SIZE);
+    let (mut min, mut max, mut line) = (0.0f32, 0.0f32, 0.0f32);
+    for token in tokenize(spans, fonts, TABLE_FONT_SIZE, force_bold) {
+        match token {
+            Token::Word(word) => {
+                min = min.max(word.width);
+                line += if line > 0.0 { space_width } else { 0.0 } + word.width;
+                max = max.max(line);
+            }
+            Token::Break => line = 0.0,
         }
+    }
+    let padding = TABLE_CELL_PADDING * 2.0;
+    Demand {
+        min: min + padding,
+        max: max + padding,
     }
 }
 
-fn natural_column_widths(
+/// Per-column demand over the header (measured bold) and every body row.
+fn column_demands(
     fonts: &FontSet,
     num_cols: usize,
     header: &[Vec<Span>],
     rows: &[Vec<Vec<Span>>],
-) -> Vec<f32> {
-    let mut widths = vec![TABLE_CELL_PADDING * 2.0 + 10.0; num_cols];
-    let mut header_bold: Vec<Vec<Span>> = header.to_vec();
-    for cell in &mut header_bold {
-        for span in cell.iter_mut() {
-            span.bold = true;
+) -> Vec<Demand> {
+    let floor = TABLE_CELL_PADDING * 2.0 + MIN_COLUMN_CONTENT;
+    let mut demands = vec![
+        Demand {
+            min: floor,
+            max: floor
+        };
+        num_cols
+    ];
+    let rows = std::iter::once((header, true)).chain(rows.iter().map(|r| (r.as_slice(), false)));
+    for (cells, bold) in rows {
+        for (demand, spans) in demands.iter_mut().zip(cells) {
+            let cell = cell_demand(fonts, spans, bold);
+            demand.min = demand.min.max(cell.min);
+            demand.max = demand.max.max(cell.max);
         }
     }
-    measure_row_natural(fonts, &header_bold, &mut widths);
-    for row in rows {
-        measure_row_natural(fonts, row, &mut widths);
-    }
-    widths
+    demands
 }
 
 /// Wraps every cell of a row within its column width and returns the row's
@@ -931,14 +950,8 @@ impl<'a> Renderer<'a> {
             .max(1);
         let available_width = (PAGE_WIDTH_PT - MARGIN_PT - x0).max(1.0);
 
-        let mut col_widths = natural_column_widths(&self.fonts, num_cols, header, rows);
-        let total: f32 = col_widths.iter().sum();
-        if total > available_width {
-            let scale = available_width / total;
-            for w in &mut col_widths {
-                *w *= scale;
-            }
-        }
+        let demands = column_demands(&self.fonts, num_cols, header, rows);
+        let col_widths = column_widths(&demands, available_width);
 
         let (header_lines, header_height) =
             layout_table_row(&self.fonts, &col_widths, header, true);
@@ -1626,6 +1639,72 @@ mod tests {
         assert_eq!(rendered.warnings.len(), 2);
         assert!(rendered.warnings[0].contains("missing.png"));
         assert!(rendered.warnings[1].contains("bad.png"));
+    }
+
+    fn table(header: &[&str], rows: &[Vec<String>]) -> Block {
+        Block::Table {
+            alignments: vec![Align::None; header.len()],
+            header: header.iter().map(|h| vec![Span::plain(*h)]).collect(),
+            rows: rows
+                .iter()
+                .map(|r| r.iter().map(|c| vec![Span::plain(c.as_str())]).collect())
+                .collect(),
+        }
+    }
+
+    /// Table cell rectangles of every page, page by page.
+    fn cell_boxes(rendered: &Rendered) -> Vec<Vec<Rect>> {
+        rendered
+            .pages
+            .iter()
+            .map(|ops| rectangles(ops).into_iter().cloned().collect())
+            .collect()
+    }
+
+    #[test]
+    fn long_unbreakable_cell_keeps_its_word_whole_when_another_column_can_wrap() {
+        let url = "https://example.com/a/rather/long/path/to/some/resource";
+        let prose = "words that can wrap onto several lines without any trouble at all, ".repeat(4);
+        let rows = vec![vec![url.to_string(), prose]];
+        let ops = rendered_ops(&[table(&["Link", "Notes"], &rows)]);
+        let texts: Vec<String> = text_runs(&ops).into_iter().map(|r| r.0).collect();
+        assert!(texts.iter().any(|t| t == url), "URL was split: {texts:?}");
+    }
+
+    #[test]
+    fn table_fits_the_printable_width() {
+        let wide = "x".repeat(400);
+        let rows = vec![vec![wide.clone(), wide.clone(), wide]];
+        let rendered = render_with(&[table(&["a", "b", "c"], &rows)], &Images::new());
+        for rect in cell_boxes(&rendered).concat() {
+            assert!(rect.x.0 >= MARGIN_PT - 0.01);
+            assert!(rect.x.0 + rect.width.0 <= PAGE_WIDTH_PT - MARGIN_PT + 0.01);
+        }
+    }
+
+    #[test]
+    fn mixed_style_cell_is_measured_per_span() {
+        // One bold word must not make the whole cell be measured in bold.
+        let fonts = FontSet::load().unwrap();
+        let spans = vec![
+            Span::plain("regular text "),
+            Span {
+                text: "b".into(),
+                bold: true,
+                ..Default::default()
+            },
+        ];
+        let demand = cell_demand(&fonts, &spans, false);
+        let expected = text_width_pt(&fonts.sans_regular, "regular text ", TABLE_FONT_SIZE)
+            + text_width_pt(&fonts.sans_bold, "b", TABLE_FONT_SIZE)
+            + 2.0 * TABLE_CELL_PADDING;
+        assert!(
+            (demand.max - expected).abs() < 0.01,
+            "{} vs {expected}",
+            demand.max
+        );
+        let longest = text_width_pt(&fonts.sans_regular, "regular", TABLE_FONT_SIZE);
+        assert!((demand.min - (longest + 2.0 * TABLE_CELL_PADDING)).abs() < 0.01);
     }
 
     #[test]
