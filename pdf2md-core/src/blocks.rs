@@ -73,6 +73,20 @@ pub enum PageItems {
     Failed(u32),
 }
 
+impl PageItems {
+    /// The tables on this page, with their page number.
+    pub fn tables(&self) -> impl Iterator<Item = (u32, &Table)> {
+        let items = match self {
+            PageItems::Items(items) => items.as_slice(),
+            PageItems::Failed(_) => &[],
+        };
+        items.iter().filter_map(|item| match item {
+            Item::Table { page, table } => Some((*page, table)),
+            _ => None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Kind {
     Body,

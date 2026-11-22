@@ -131,7 +131,7 @@ column by column, then rebuilds Markdown blocks:
 | `**bold**`, `*italic*`, `` `code` `` | Font names, font descriptor flags, and equal glyph widths for monospace faces. |
 | `[text](url)` | URI link annotations over the text. |
 | Fenced code blocks | Runs of monospace lines; indentation recovered from glyph positions. |
-| GFM tables | Drawn rulings first: cell grids (borders, line grids) and rule-only "booktabs" tables (top/mid/bottom rules); otherwise ≥ 3 lines whose text columns line up. Column alignment (`:--`, `:-:`, `--:`) from where cell text sits; multi-line cells joined with `<br>`; the first row is the header. |
+| GFM tables | Drawn rulings first: cell grids (borders, line grids; tolerances scale with the text, so slightly misaligned or broken lines still form one grid) and rule-only "booktabs" tables (top/mid/bottom rules; tightly set columns are split at the header words); otherwise ≥ 3 lines whose text columns line up (numbered equations excluded). Column alignment (`:--`, `:-:`, `--:`) from where cell text sits; multi-line cells joined with `<br>`; the first row is the header. A table continued on the next page (same columns, ending near the page bottom and resuming near the next top) is merged into one, its repeated header dropped. |
 | `![](img-001.png)` | Raster image XObjects and inline images: JPEG copied as is, other bitmaps re-encoded as PNG (alpha from the soft mask). An image drawn several times (a logo) is stored once; one repeated in the header/footer band is dropped like repeated text. |
 | `---` | A long horizontal line with no text on it. |
 
@@ -144,9 +144,10 @@ Limitations: scanned PDFs (no text layer) and password-protected files are not
 supported; rotated text, vector figures/charts and math are not reconstructed
 (vector drawings are not rasterised); `JPXDecode` / `CCITTFaxDecode` /
 `JBIG2Decode` images become an `<!-- unsupported image (…) -->` comment; image
-alt text stays empty; tables are GFM only, so spanning cells are flattened (text
-in the first cell) and a table split across pages stays two tables; borderless
-tables are detected conservatively (a missed table is preferred to a false one);
+alt text stays empty; tables are GFM only, so merged cells are flattened (text
+in the first cell, reported as a warning); borderless tables are detected
+conservatively (a missed table is preferred to a false one; near misses are
+reported as warnings);
 a hyphen at a line end followed by a lowercase word is always treated as
 hyphenation (`document-level` → `documentlevel`).
 

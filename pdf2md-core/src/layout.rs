@@ -19,7 +19,7 @@ const BASELINE_TOLERANCE: f32 = 0.45;
 /// Horizontal gap (in font sizes) that splits a baseline into segments.
 const SEGMENT_GAP: f32 = 1.5;
 /// Fraction of the page height treated as header/footer band at each edge.
-const FURNITURE_BAND: f32 = 0.08;
+pub const FURNITURE_BAND: f32 = 0.08;
 /// Minimum gutter width (pt) for two-column detection.
 const MIN_GUTTER: f32 = 6.0;
 /// A horizontal rule must span at least this share of the page width.
@@ -166,8 +166,9 @@ pub fn half_points(size: f32) -> i32 {
     (size * 2.0).round() as i32
 }
 
-/// Lays out all pages into one reading-ordered list of items.
-pub fn items(pages: &[Page], keep_furniture: bool) -> Vec<Item> {
+/// Lays out all pages into one reading-ordered list of items, with warnings
+/// about near-miss tables left as text.
+pub fn items(pages: &[Page], keep_furniture: bool) -> (Vec<Item>, Vec<String>) {
     let mut segmented: Vec<(&Page, Vec<Segment>)> = Vec::new();
     let mut things: Vec<Vec<(Thing, [f32; 4])>> = Vec::new();
     for page in pages {
@@ -196,11 +197,13 @@ pub fn items(pages: &[Page], keep_furniture: bool) -> Vec<Item> {
         strip_furniture(&mut segmented);
         strip_furniture_things(&segmented, &mut things);
     }
-    segmented
+    let mut warnings = Vec::new();
+    let items = segmented
         .into_iter()
         .zip(things)
-        .flat_map(|((page, segments), things)| page_items(page, segments, things))
-        .collect()
+        .flat_map(|((page, segments), things)| page_items(page, segments, things, &mut warnings))
+        .collect();
+    (items, warnings)
 }
 
 /// Long horizontal rulings that no text sits on (underlines, strike-throughs).
@@ -563,11 +566,14 @@ fn reading_order(groups: Vec<Group>) -> Vec<(usize, Group)> {
 
 /// Replaces runs of ≥ 3 consecutive lines of one column, each split into
 /// ≥ 2 segments whose gaps line up, with a borderless table.
+/// Returns the groups, tables replacing their rows, and how many candidates
+/// were near misses (see [`tables::Rejected::is_ambiguous`]).
 fn alignment_tables(
     groups: Vec<Group>,
     things: &mut Vec<Option<(Thing, [f32; 4])>>,
     size: f32,
-) -> Vec<Group> {
+) -> (Vec<Group>, usize) {
+    let mut near_misses = 0;
     let is_row = |group: &Group| group.1.len() >= 2 && group.1.iter().all(|s| s.thing.is_none());
     let mut runs: Vec<Vec<usize>> = Vec::new();
     for column in [Column::Full, Column::Left, Column::Right] {
@@ -607,10 +613,13 @@ fn alignment_tables(
             })
             .collect();
         let misses = usize::from(rows.len() >= 4);
-        let Some(table) =
-            tables::aligned(&rows, 1.0, misses, true).filter(|t| !tables::looks_like_columns(t))
-        else {
-            continue;
+        let table = match tables::verdict(&rows, 1.0, misses, true) {
+            Ok(table) if !tables::looks_like_columns(&table) => table,
+            Ok(_) => continue,
+            Err(rejected) => {
+                near_misses += usize::from(rejected.is_ambiguous());
+                continue;
+            }
         };
         let column = run
             .first()
@@ -623,20 +632,22 @@ fn alignment_tables(
             replaced.insert(i, (k == 0).then(|| (column, vec![placeholder.clone()])));
         }
     }
-    groups
+    let groups = groups
         .into_iter()
         .enumerate()
         .filter_map(|(i, group)| match replaced.remove(&i) {
             Some(replacement) => replacement,
             None => Some(group),
         })
-        .collect()
+        .collect();
+    (groups, near_misses)
 }
 
 fn page_items(
     page: &Page,
     mut segments: Vec<Segment>,
     things: Vec<(Thing, [f32; 4])>,
+    warnings: &mut Vec<String>,
 ) -> Vec<Item> {
     let size = match dominant_size(&page.glyphs) {
         s if s > 0.0 => s,
@@ -645,14 +656,22 @@ fn page_items(
     // Things join the top-down segment order by the top of their box.
     for (index, (_, bbox)) in things.iter().enumerate() {
         let placeholder = Segment::thing(index, *bbox, size);
+        // Compare with things placed already too: two tables stacked with no
+        // text between them keep their top-down order.
         let at = segments
             .iter()
-            .position(|s| s.thing.is_none() && s.y < placeholder.y)
+            .position(|s| s.y < placeholder.y)
             .unwrap_or(segments.len());
         segments.insert(at, placeholder);
     }
     let mut things: Vec<Option<(Thing, [f32; 4])>> = things.into_iter().map(Some).collect();
-    let groups = alignment_tables(column_groups(segments), &mut things, size);
+    let (groups, near_misses) = alignment_tables(column_groups(segments), &mut things, size);
+    warnings.extend((0..near_misses).map(|_| {
+        format!(
+            "page {}: text lines up like a table, but too few cells are filled; left as paragraphs",
+            page.number
+        )
+    }));
     let ordered = reading_order(groups);
 
     let mut items: Vec<Item> = Vec::new();
@@ -741,8 +760,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn near_miss_table_stays_text_and_is_reported() {
+        // Four columns line up, but each row fills only two of them.
+        let rows: Vec<(String, f32, f32)> = (0..6)
+            .flat_map(|i| {
+                let y = 700.0 - i as f32 * 14.0;
+                let xs = if i % 2 == 0 {
+                    [72.0, 290.0]
+                } else {
+                    [180.0, 400.0]
+                };
+                xs.into_iter().map(move |x| (format!("c{i}"), x, y))
+            })
+            .collect();
+        let words: Vec<(&str, f32, f32)> =
+            rows.iter().map(|(t, x, y)| (t.as_str(), *x, *y)).collect();
+        let (items, warnings) = items(&[page(1, &words)], true);
+        assert!(items.iter().all(|i| matches!(i, Item::Line(_))));
+        assert_eq!(
+            warnings,
+            [
+                "page 1: text lines up like a table, but too few cells are filled; left as paragraphs"
+            ]
+        );
+    }
+
     fn lines(pages: &[Page], keep: bool) -> Vec<Line> {
         items(pages, keep)
+            .0
             .into_iter()
             .filter_map(|item| match item {
                 Item::Line(line) => Some(line),

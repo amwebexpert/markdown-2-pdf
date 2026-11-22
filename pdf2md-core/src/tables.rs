@@ -3,16 +3,48 @@
 
 use crate::interp::{Glyph, Ruling};
 
-/// Rulings this close (pt) across their axis are collinear.
+/// Rulings this close (pt) across their axis are collinear, at least; the
+/// actual tolerance grows with the text size (see `Tolerance`).
 const COLLINEAR: f32 = 1.0;
 /// Rulings this close (pt) along their axis, or across each other, touch.
 const TOUCH: f32 = 2.0;
+/// Collinear / touch tolerances as a share of the median glyph size, so a
+/// divider drawn 1.5 pt off or a rule broken by 3 pt still lines up.
+const COLLINEAR_SHARE: f32 = 0.2;
+const TOUCH_SHARE: f32 = 0.4;
+/// Upper bounds, so large type can't fuse separate tables or a nearby rule.
+const MAX_COLLINEAR: f32 = 2.0;
+const MAX_TOUCH: f32 = 4.0;
+
+/// Geometric tolerances (pt) for one page, scaled to its text.
+#[derive(Debug, Clone, Copy)]
+struct Tolerance {
+    collinear: f32,
+    touch: f32,
+}
+
+impl Tolerance {
+    fn for_glyphs(glyphs: &[Glyph]) -> Self {
+        let size = median_glyph_size(glyphs.iter().filter(|g| !g.synthetic)).unwrap_or(0.0);
+        Tolerance {
+            collinear: (COLLINEAR_SHARE * size).clamp(COLLINEAR, MAX_COLLINEAR),
+            touch: (TOUCH_SHARE * size).clamp(TOUCH, MAX_TOUCH),
+        }
+    }
+}
 /// Rule-only tables: rules whose ends differ by at most this (pt) align.
 const SAME_EXTENT: f32 = 3.0;
 /// Smallest share of non-empty cells for a ruled grid to be a table.
 const MIN_GRID_FILL: f32 = 0.3;
 /// Smallest share of non-empty cells for an alignment table.
 const MIN_ALIGNED_FILL: f32 = 0.6;
+/// Sweeps for gaps between text columns step this many times per pt.
+const SWEEP_STEPS_PER_PT: f32 = 2.0;
+/// A column opened by a header word needs text in this share of body rows.
+const MIN_HEADER_COLUMN_FILL: f32 = 0.5;
+/// A sparse candidate this close to `MIN_ALIGNED_FILL` (share of it) is a
+/// near miss, reported as ambiguous.
+const NEAR_MISS_SHARE: f32 = 0.8;
 /// Gap between glyphs (in font sizes) that separates words.
 const WORD_GAP: f32 = 0.15;
 
@@ -27,13 +59,52 @@ pub enum Align {
 /// One table cell: its text lines, glyphs sorted left to right.
 pub type Cell = Vec<Vec<Glyph>>;
 
+/// What a table was recognised from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Evidence {
+    /// A grid of drawn rulings (cell borders or line grid).
+    Ruled,
+    /// Horizontal rules only (booktabs top/mid/bottom rules).
+    RuleOnly,
+    /// Text columns lining up, no rulings.
+    Aligned,
+}
+
+/// A merged cell: `rows × cols` grid cells from (`row`, `col`), its text in
+/// that first cell. GFM has no spans, so it is emitted flattened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub row: usize,
+    pub col: usize,
+    pub rows: usize,
+    pub cols: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct Table {
     /// `[x0, y0, x1, y1]` in user space.
     pub bbox: [f32; 4],
+    /// Column boundaries, left to right (`align.len() + 1` values): drawn
+    /// rulings, or the middle of the gaps between aligned text columns.
+    pub columns: Vec<f32>,
     pub align: Vec<Align>,
     /// `rows[0]` is the header row; every row has `align.len()` cells.
     pub rows: Vec<Vec<Cell>>,
+    /// Merged cells (ruled grids with a missing inner border).
+    pub spans: Vec<Span>,
+    pub evidence: Evidence,
+}
+
+impl Table {
+    /// Warning for a table whose merged cells can't be represented in GFM.
+    pub fn flattened_warning(&self, page: u32) -> Option<String> {
+        (!self.spans.is_empty()).then(|| {
+            format!(
+                "page {page}: table has merged cells; GFM can't span them, so each keeps its \
+                 text in its first cell"
+            )
+        })
+    }
 }
 
 /// Horizontal extent of a piece of text on one line.
@@ -80,7 +151,7 @@ pub fn text_lines(glyphs: Vec<Glyph>) -> Vec<Vec<Glyph>> {
 
 /// Merges overlapping or touching collinear rulings (md2pdf strokes every
 /// cell rectangle, so shared edges are drawn twice).
-fn merge(mut rulings: Vec<Ruling>) -> Vec<Ruling> {
+fn merge(mut rulings: Vec<Ruling>, tolerance: Tolerance) -> Vec<Ruling> {
     rulings.sort_by(|a, b| a.pos.total_cmp(&b.pos));
     let mut groups: Vec<Vec<Ruling>> = Vec::new();
     for ruling in rulings {
@@ -88,7 +159,7 @@ fn merge(mut rulings: Vec<Ruling>) -> Vec<Ruling> {
             Some(group)
                 if group
                     .first()
-                    .is_some_and(|f| ruling.pos - f.pos <= COLLINEAR) =>
+                    .is_some_and(|f| ruling.pos - f.pos <= tolerance.collinear) =>
             {
                 group.push(ruling);
             }
@@ -101,7 +172,7 @@ fn merge(mut rulings: Vec<Ruling>) -> Vec<Ruling> {
         let mut current: Option<Ruling> = None;
         for ruling in group {
             match current.as_mut() {
-                Some(c) if ruling.from <= c.to + TOUCH => c.to = c.to.max(ruling.to),
+                Some(c) if ruling.from <= c.to + tolerance.touch => c.to = c.to.max(ruling.to),
                 _ => merged.extend(current.replace(ruling)),
             }
         }
@@ -110,11 +181,11 @@ fn merge(mut rulings: Vec<Ruling>) -> Vec<Ruling> {
     merged
 }
 
-fn touches(h: &Ruling, v: &Ruling) -> bool {
-    v.pos >= h.from - TOUCH
-        && v.pos <= h.to + TOUCH
-        && h.pos >= v.from - TOUCH
-        && h.pos <= v.to + TOUCH
+fn touches(h: &Ruling, v: &Ruling, touch: f32) -> bool {
+    v.pos >= h.from - touch
+        && v.pos <= h.to + touch
+        && h.pos >= v.from - touch
+        && h.pos <= v.to + touch
 }
 
 fn find(parent: &mut [usize], mut i: usize) -> usize {
@@ -157,16 +228,17 @@ pub struct Ruled {
 
 /// Detects grid and rule-only tables, taking their glyphs out of the page.
 pub fn ruled(rulings: &[Ruling], glyphs: Vec<Glyph>) -> Ruled {
+    let tolerance = Tolerance::for_glyphs(&glyphs);
     let (horizontal, vertical): (Vec<Ruling>, Vec<Ruling>) =
         rulings.iter().partition(|r| r.horizontal);
-    let horizontal = merge(horizontal);
-    let vertical = merge(vertical);
+    let horizontal = merge(horizontal, tolerance);
+    let vertical = merge(vertical, tolerance);
 
     let all: Vec<&Ruling> = horizontal.iter().chain(&vertical).collect();
     let mut parent: Vec<usize> = (0..all.len()).collect();
     for (i, h) in horizontal.iter().enumerate() {
         for (j, v) in vertical.iter().enumerate() {
-            if touches(h, v) {
+            if touches(h, v, tolerance.touch) {
                 union(&mut parent, i, horizontal.len() + j);
             }
         }
@@ -204,7 +276,7 @@ pub fn ruled(rulings: &[Ruling], glyphs: Vec<Glyph>) -> Ruled {
             .collect();
         if hs.len() >= 2 && vs.len() >= 2 {
             let remaining = std::mem::take(&mut out.glyphs);
-            match grid(&hs, &vs, remaining) {
+            match grid(&hs, &vs, remaining, tolerance) {
                 Ok((table, rest)) => {
                     out.tables.push(table);
                     out.glyphs = rest;
@@ -228,9 +300,11 @@ fn grid(
     hs: &[Ruling],
     vs: &[Ruling],
     glyphs: Vec<Glyph>,
+    tolerance: Tolerance,
 ) -> Result<(Table, Vec<Glyph>), Vec<Glyph>> {
-    let xs = distinct(vs.iter().map(|r| r.pos).collect(), COLLINEAR);
-    let mut ys = distinct(hs.iter().map(|r| r.pos).collect(), COLLINEAR);
+    let collinear = tolerance.collinear;
+    let xs = distinct(vs.iter().map(|r| r.pos).collect(), collinear);
+    let mut ys = distinct(hs.iter().map(|r| r.pos).collect(), collinear);
     ys.reverse(); // top-down
     let (Some(&left), Some(&right), Some(&top), Some(&bottom)) =
         (xs.first(), xs.last(), ys.first(), ys.last())
@@ -256,11 +330,11 @@ fn grid(
             let mid_x = f32::midpoint(x_at(c), x_at(c + 1));
             let has_v = |x: f32| {
                 vs.iter()
-                    .any(|v| (v.pos - x).abs() <= COLLINEAR && v.from <= mid_y && v.to >= mid_y)
+                    .any(|v| (v.pos - x).abs() <= collinear && v.from <= mid_y && v.to >= mid_y)
             };
             let has_h = |y: f32| {
                 hs.iter()
-                    .any(|h| (h.pos - y).abs() <= COLLINEAR && h.from <= mid_x && h.to >= mid_x)
+                    .any(|h| (h.pos - y).abs() <= collinear && h.from <= mid_x && h.to >= mid_x)
             };
             if c + 1 < cols && !has_v(x_at(c + 1)) {
                 union(&mut parent, index(r, c), index(r, c + 1));
@@ -304,15 +378,8 @@ fn grid(
         return Err(rest);
     }
 
-    let spanning: Vec<bool> = (0..rows * cols)
-        .map(|i| {
-            let root = find(&mut parent, i);
-            (0..rows * cols)
-                .filter(|&j| find(&mut parent, j) == root)
-                .count()
-                > 1
-        })
-        .collect();
+    let roots: Vec<usize> = (0..rows * cols).map(|i| find(&mut parent, i)).collect();
+    let (spanning, spans) = merged_cells(&roots, cols);
     let mut cells = cell_glyphs.into_iter().map(text_lines);
     let table_rows: Vec<Vec<Cell>> = (0..rows)
         .map(|_| cells.by_ref().take(cols).collect())
@@ -330,11 +397,40 @@ fn grid(
     Ok((
         Table {
             bbox,
+            columns: xs,
             align,
             rows: table_rows,
+            spans,
+            evidence: Evidence::Ruled,
         },
         rest,
     ))
+}
+
+/// Which grid cells belong to a merged group (`roots[i]` is cell `i`'s
+/// group anchor), and the groups as spans.
+fn merged_cells(roots: &[usize], cols: usize) -> (Vec<bool>, Vec<Span>) {
+    let size = |root: usize| roots.iter().filter(|r| **r == root).count();
+    let spanning = roots.iter().map(|&root| size(root) > 1).collect();
+    let spans = roots
+        .iter()
+        .enumerate()
+        .filter(|&(i, &root)| i == root && size(root) > 1)
+        .map(|(anchor, _)| {
+            let members = roots.iter().enumerate().filter(|&(_, &r)| r == anchor);
+            let (rs, cs): (Vec<usize>, Vec<usize>) =
+                members.map(|(i, _)| (i / cols, i % cols)).unzip();
+            let extent =
+                |v: &[usize]| v.iter().max().unwrap_or(&0) - v.iter().min().unwrap_or(&0) + 1;
+            Span {
+                row: anchor / cols,
+                col: anchor % cols,
+                rows: extent(&rs),
+                cols: extent(&cs),
+            }
+        })
+        .collect();
+    (spanning, spans)
 }
 
 /// Horizontal extent of a cell's text.
@@ -432,8 +528,22 @@ fn booktabs(rules: Vec<Ruling>, glyphs: &mut Vec<Glyph>) -> (Vec<Table>, Vec<Rul
         let rows: Vec<Vec<Piece>> = lines.into_iter().map(|line| split(line, 0.6)).collect();
         let misses = usize::from(rows.len() >= 4);
         *glyphs = outer;
-        if let Some(mut table) = aligned(&rows, 0.8, misses, false) {
+        // Columns set too tightly for a shared gap: follow the header words.
+        let header_guided = || {
+            (!other_aligned_text(&rows))
+                .then(|| table_from_gaps(&rows, &header_gaps(&rows, misses), false).ok())
+                .flatten()
+        };
+        let best = match aligned(&rows, 0.8, misses, false) {
+            Some(by_gaps) => match header_guided() {
+                Some(by_header) if by_header.align.len() > by_gaps.align.len() => Some(by_header),
+                _ => Some(by_gaps),
+            },
+            None => header_guided(),
+        };
+        if let Some(mut table) = best {
             table.bbox = [from, bottom, to, top];
+            table.evidence = Evidence::RuleOnly;
             tables.push(table);
         } else {
             glyphs.extend(inner);
@@ -492,11 +602,11 @@ fn shared_gaps(
     min_gap: f32,
     misses: usize,
 ) -> Vec<(f32, f32)> {
-    let steps = ((right - left) * 2.0).max(0.0) as usize;
+    let steps = ((right - left) * SWEEP_STEPS_PER_PT).max(0.0) as usize;
     let mut gaps: Vec<(f32, f32)> = Vec::new();
     let mut run: Option<f32> = None;
     for step in 0..=steps {
-        let x = left + step as f32 / 2.0;
+        let x = left + step as f32 / SWEEP_STEPS_PER_PT;
         let covered = rows
             .iter()
             .filter(|row| row.iter().any(|p| x >= p.x0 && x <= p.x1))
@@ -554,40 +664,189 @@ fn other_aligned_text(rows: &[Vec<Piece>]) -> bool {
 /// but `misses` of them split them into ≥ 2 columns. `merge` folds wrapped
 /// rows together and then requires ≥ 3 rows.
 pub fn aligned(rows: &[Vec<Piece>], min_gap: f32, misses: usize, merge: bool) -> Option<Table> {
-    if rows.len() < 2 || other_aligned_text(rows) {
-        return None;
+    verdict(rows, min_gap, misses, merge).ok()
+}
+
+/// Why aligned text was not taken for a table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rejected {
+    /// No x range empty in (almost) every row.
+    NoColumns,
+    /// Fewer than 2 rows, or fewer than 3 once wrapped rows are folded.
+    TooFewRows,
+    /// A list with wide gaps after its markers, or code.
+    OtherText,
+    /// Equations with their numbers in a right-hand column.
+    Equations,
+    /// Columns line up but too few cells have text, though close to the
+    /// threshold (see `NEAR_MISS_SHARE`): a near miss worth reporting.
+    Sparse,
+    /// Columns line up but most cells are empty.
+    Scattered,
+}
+
+impl Rejected {
+    /// A near miss: reported so a missed table doesn't go unnoticed.
+    pub fn is_ambiguous(self) -> bool {
+        self == Rejected::Sparse
+    }
+}
+
+/// [`aligned`], saying why when the rows are not taken for a table.
+pub fn verdict(
+    rows: &[Vec<Piece>],
+    min_gap: f32,
+    misses: usize,
+    merge: bool,
+) -> Result<Table, Rejected> {
+    if rows.len() < 2 {
+        return Err(Rejected::TooFewRows);
+    }
+    if other_aligned_text(rows) {
+        return Err(Rejected::OtherText);
     }
     let pieces = rows.iter().flatten();
-    let left = pieces.clone().map(|p| p.x0).reduce(f32::min)?;
-    let right = pieces.clone().map(|p| p.x1).reduce(f32::max)?;
+    let left = pieces.clone().map(|p| p.x0).reduce(f32::min);
+    let right = pieces.map(|p| p.x1).reduce(f32::max);
+    let (Some(left), Some(right), Some(size)) = (left, right, median_size(rows)) else {
+        return Err(Rejected::NoColumns);
+    };
+    let gaps = shared_gaps(rows, left, right, min_gap * size, misses);
+    let table = table_from_gaps(rows, &gaps, merge)?;
+    if numbered_equations(&table) {
+        return Err(Rejected::Equations);
+    }
+    Ok(table)
+}
+
+/// Every filled cell of the last column is an equation number: `(1)`, `(2a)`.
+fn numbered_equations(table: &Table) -> bool {
+    let numbers: Vec<String> = table
+        .rows
+        .iter()
+        .filter_map(|row| row.last())
+        .map(|cell| cell.iter().flatten().map(|g| g.text.as_str()).collect())
+        .filter(|text: &String| !text.is_empty())
+        .collect();
+    !numbers.is_empty()
+        && numbers.iter().all(|text| {
+            text.strip_prefix('(')
+                .and_then(|t| t.strip_suffix(')'))
+                .is_some_and(|n| {
+                    n.chars().next().is_some_and(|c| c.is_ascii_digit())
+                        && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '.')
+                })
+        })
+}
+
+/// Median size of the glyphs that have one.
+fn median_glyph_size<'g>(glyphs: impl Iterator<Item = &'g Glyph>) -> Option<f32> {
+    let mut sizes: Vec<f32> = glyphs.map(|g| g.size).filter(|&s| s > 0.0).collect();
+    sizes.sort_by(f32::total_cmp);
+    sizes.get(sizes.len() / 2).copied()
+}
+
+/// Median glyph size of the rows.
+fn median_size(rows: &[Vec<Piece>]) -> Option<f32> {
+    median_glyph_size(rows.iter().flatten().flat_map(|p| &p.glyphs))
+}
+
+/// Column gaps read from the header row (`rows[0]`) when the columns are set
+/// too tightly for a shared gap. Between two consecutive header words, the
+/// column edge is the rightmost x that at most `misses` body words cross, so
+/// left- and right-aligned columns both split correctly. Edges opening a
+/// column with text in fewer than half the body rows are dropped, so a header
+/// cell of several words does not become several columns.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "page coordinates are small positive numbers"
+)]
+fn header_gaps(rows: &[Vec<Piece>], misses: usize) -> Vec<(f32, f32)> {
+    let words = |row: &Vec<Piece>| -> Vec<Piece> {
+        row.iter()
+            .flat_map(|p| split(p.glyphs.clone(), WORD_GAP))
+            .collect()
+    };
+    let Some((header, body)) = rows.split_first() else {
+        return Vec::new();
+    };
+    let header = words(header);
+    let body: Vec<Vec<Piece>> = body.iter().map(words).collect();
+    if body.is_empty() {
+        return Vec::new();
+    }
+    let crossing = |x: f32| {
+        body.iter()
+            .filter(|row| row.iter().any(|w| w.x0 < x && w.x1 > x))
+            .count()
+    };
+    let mut edges: Vec<f32> = header
+        .windows(2)
+        .filter_map(|pair| {
+            let [previous, word] = pair else { return None };
+            let steps = ((word.x0 - previous.x1) * SWEEP_STEPS_PER_PT).max(0.0) as usize;
+            (0..=steps)
+                .map(|step| word.x0 - step as f32 / SWEEP_STEPS_PER_PT)
+                .find(|&x| crossing(x) <= misses)
+        })
+        .collect();
+    // Drop edges opening a mostly empty column, until none does.
+    while let Some(k) = (0..edges.len()).find(|&k| {
+        let from = edges.get(k).copied().unwrap_or(f32::MAX);
+        let to = edges.get(k + 1).copied().unwrap_or(f32::MAX);
+        let filled = body
+            .iter()
+            .filter(|row| row.iter().any(|w| w.x0 >= from && w.x0 < to))
+            .count();
+        (filled as f32) < MIN_HEADER_COLUMN_FILL * body.len() as f32
+    }) {
+        edges.remove(k);
+    }
+    edges.into_iter().map(|edge| (edge, edge)).collect()
+}
+
+/// Builds the table for columns split at `gaps`, or says why the rows are
+/// not one (no gap, too few rows once wrapped rows are folded, too sparse). `merge` folds wrapped rows together
+/// and then requires ≥ 3 rows.
+fn table_from_gaps(
+    rows: &[Vec<Piece>],
+    gaps: &[(f32, f32)],
+    merge: bool,
+) -> Result<Table, Rejected> {
+    let pieces = rows.iter().flatten();
+    let (Some(left), Some(right)) = (
+        pieces.clone().map(|p| p.x0).reduce(f32::min),
+        pieces.clone().map(|p| p.x1).reduce(f32::max),
+    ) else {
+        return Err(Rejected::NoColumns);
+    };
+    if gaps.is_empty() {
+        return Err(Rejected::NoColumns);
+    }
     let glyphs = pieces.flat_map(|p| &p.glyphs);
     let top = glyphs
         .clone()
         .map(|g| g.y + g.size)
         .fold(f32::MIN, f32::max);
-    let bottom = glyphs.clone().map(|g| g.y).fold(f32::MAX, f32::min);
-    let size = {
-        let mut sizes: Vec<f32> = glyphs.map(|g| g.size).collect();
-        sizes.sort_by(f32::total_cmp);
-        sizes.get(sizes.len() / 2).copied()?
-    };
-
-    let gaps = shared_gaps(rows, left, right, min_gap * size, misses);
-    if gaps.is_empty() {
-        return None;
-    }
+    let bottom = glyphs.map(|g| g.y).fold(f32::MAX, f32::min);
     let cols = gaps.len() + 1;
-    let (mut table_rows, mut boxes) = fill(rows, &gaps);
+    let (mut table_rows, mut boxes) = fill(rows, gaps);
     if merge {
         merge_continuations(&mut table_rows, &mut boxes);
         if table_rows.len() < 3 {
-            return None;
+            return Err(Rejected::TooFewRows);
         }
     }
     let total = table_rows.len() * cols;
     let filled = boxes.iter().flatten().filter(|e| e.is_some()).count();
-    if (filled as f32) < MIN_ALIGNED_FILL * total as f32 {
-        return None;
+    let fill = filled as f32 / total.max(1) as f32;
+    if fill < MIN_ALIGNED_FILL {
+        return Err(if fill >= NEAR_MISS_SHARE * MIN_ALIGNED_FILL {
+            Rejected::Sparse
+        } else {
+            Rejected::Scattered
+        });
     }
 
     let align = (0..cols)
@@ -607,10 +866,17 @@ pub fn aligned(rows: &[Vec<Piece>], min_gap: f32, misses: usize, merge: bool) ->
             cell.retain(|line| !line.is_empty());
         }
     }
-    Some(Table {
+    let columns = std::iter::once(left)
+        .chain(gaps.iter().map(|&(a, b)| f32::midpoint(a, b)))
+        .chain(std::iter::once(right))
+        .collect();
+    Ok(Table {
         bbox: [left, bottom, right, top],
+        columns,
         align,
         rows: table_rows,
+        spans: Vec::new(),
+        evidence: Evidence::Aligned,
     })
 }
 
@@ -750,7 +1016,10 @@ mod tests {
     #[test]
     fn per_cell_rectangles_merge_into_one_grid() {
         let rulings = cell_rects(&[100.0, 200.0, 300.0], &[700.0, 680.0, 660.0]);
-        let merged = merge(rulings.iter().filter(|r| r.horizontal).copied().collect());
+        let merged = merge(
+            rulings.iter().filter(|r| r.horizontal).copied().collect(),
+            Tolerance::for_glyphs(&[]),
+        );
         assert_eq!(merged.len(), 3);
         assert!(
             merged
@@ -786,6 +1055,120 @@ mod tests {
         glyphs.extend(word("b", 204.0, 666.0));
         let table = ruled(&rulings, glyphs).tables.remove(0);
         assert_eq!(texts(&table), [["Widetitle", ""], ["a", "b"]]);
+        assert_eq!(
+            table.spans,
+            [Span {
+                row: 0,
+                col: 0,
+                rows: 1,
+                cols: 2
+            }]
+        );
+        assert_eq!(table.evidence, Evidence::Ruled);
+        assert_eq!(
+            table.flattened_warning(3).as_deref(),
+            Some(
+                "page 3: table has merged cells; GFM can't span them, so each keeps its text in its first cell"
+            )
+        );
+    }
+
+    #[test]
+    fn tables_without_spans_need_no_warning() {
+        let rulings = vec![
+            h(700.0, 100.0, 300.0),
+            h(680.0, 100.0, 300.0),
+            h(660.0, 100.0, 300.0),
+            v(100.0, 660.0, 700.0),
+            v(200.0, 660.0, 700.0),
+            v(300.0, 660.0, 700.0),
+        ];
+        let mut glyphs = word("a", 104.0, 686.0);
+        glyphs.extend(word("b", 204.0, 666.0));
+        let table = ruled(&rulings, glyphs).tables.remove(0);
+        assert!(table.spans.is_empty());
+        assert_eq!(table.flattened_warning(1), None);
+    }
+
+    /// A 2 × 2 grid's glyphs: header a/b, body c/d.
+    fn two_by_two_glyphs() -> Vec<Glyph> {
+        let mut glyphs = word("a", 104.0, 686.0);
+        glyphs.extend(word("b", 204.0, 686.0));
+        glyphs.extend(word("c", 104.0, 666.0));
+        glyphs.extend(word("d", 204.0, 666.0));
+        glyphs
+    }
+
+    #[test]
+    fn slightly_misaligned_dividers_are_one_column_edge() {
+        // The middle divider is drawn per row, 1.5 pt apart.
+        let rulings = vec![
+            h(700.0, 100.0, 300.0),
+            h(680.0, 100.0, 300.0),
+            h(660.0, 100.0, 300.0),
+            v(100.0, 660.0, 700.0),
+            v(300.0, 660.0, 700.0),
+            v(200.0, 680.0, 700.0),
+            v(201.5, 660.0, 680.0),
+        ];
+        let table = ruled(&rulings, two_by_two_glyphs()).tables.remove(0);
+        assert_eq!(texts(&table), [["a", "b"], ["c", "d"]]);
+        assert!(table.spans.is_empty());
+    }
+
+    #[test]
+    fn rule_broken_by_a_small_gap_still_separates_rows() {
+        // The middle rule has a 3 pt gap right where the first cell's middle is.
+        let rulings = vec![
+            h(700.0, 100.0, 300.0),
+            h(680.0, 100.0, 148.5),
+            h(680.0, 151.5, 300.0),
+            h(660.0, 100.0, 300.0),
+            v(100.0, 660.0, 700.0),
+            v(200.0, 660.0, 700.0),
+            v(300.0, 660.0, 700.0),
+        ];
+        let table = ruled(&rulings, two_by_two_glyphs()).tables.remove(0);
+        assert_eq!(texts(&table), [["a", "b"], ["c", "d"]]);
+        assert!(table.spans.is_empty());
+    }
+
+    #[test]
+    fn text_centred_in_a_tall_row_and_text_touching_a_border_stay_in_their_cells() {
+        let rulings = vec![
+            h(700.0, 100.0, 300.0),
+            h(680.0, 100.0, 300.0),
+            h(620.0, 100.0, 300.0),
+            v(100.0, 620.0, 700.0),
+            v(200.0, 620.0, 700.0),
+            v(300.0, 620.0, 700.0),
+        ];
+        let mut glyphs = word("a", 104.0, 686.0);
+        glyphs.extend(word("b", 204.0, 686.0));
+        // Centred in a 60 pt row, and a word whose last glyph overlaps the divider.
+        glyphs.extend(word("mid", 130.0, 647.0));
+        glyphs.extend(word("edge", 181.0, 630.0));
+        glyphs.extend(word("x", 250.0, 647.0));
+        let table = ruled(&rulings, glyphs).tables.remove(0);
+        assert_eq!(texts(&table), [["a", "b"], ["mid/edge", "x"]]);
+    }
+
+    #[test]
+    fn tolerances_grow_with_the_text_but_stay_small_for_large_type() {
+        let at = |size: f32| {
+            let mut glyphs = word("x", 0.0, 0.0);
+            for g in &mut glyphs {
+                g.size = size;
+            }
+            Tolerance::for_glyphs(&glyphs)
+        };
+        let small = at(4.0);
+        assert!((small.collinear - COLLINEAR).abs() < 1e-6 && (small.touch - TOUCH).abs() < 1e-6);
+        let body = at(10.0);
+        assert!((body.collinear - 2.0).abs() < 1e-6 && (body.touch - 4.0).abs() < 1e-6);
+        // 24 pt text: capped, so tables 6 pt apart don't touch.
+        let large = at(24.0);
+        assert!(large.collinear <= MAX_COLLINEAR && large.touch <= MAX_TOUCH);
     }
 
     #[test]
@@ -819,6 +1202,77 @@ mod tests {
             [["Model", "Score"], ["alpha", "0.91"], ["beta", "0.87"]]
         );
         assert!(ruled.glyphs.is_empty());
+    }
+
+    fn booktabs(lines: &[(f32, &[(&str, f32)])]) -> Ruled {
+        let rulings = vec![
+            h(700.0, 90.0, 400.0),
+            h(684.0, 90.0, 400.0),
+            h(640.0, 90.0, 400.0),
+        ];
+        let glyphs = lines
+            .iter()
+            .flat_map(|(y, words)| words.iter().flat_map(|(t, x)| word(t, *x, *y)))
+            .collect();
+        ruled(&rulings, glyphs)
+    }
+
+    #[test]
+    fn tightly_set_booktabs_columns_follow_the_header_words() {
+        // Columns only 4 pt (0.4 em) apart: too tight for the shared-gap sweep.
+        let ruled = booktabs(&[
+            (
+                688.0,
+                &[
+                    ("Activity", 100.0),
+                    ("Central", 200.0),
+                    ("Range", 239.0),
+                    ("Basis", 268.0),
+                ],
+            ),
+            (
+                670.0,
+                &[
+                    ("verify", 100.0),
+                    ("15s", 220.0),
+                    ("10-20", 239.0),
+                    ("medians", 268.0),
+                ],
+            ),
+            (
+                656.0,
+                &[
+                    ("check", 100.0),
+                    ("35s", 220.0),
+                    ("35-74", 239.0),
+                    ("mean", 268.0),
+                ],
+            ),
+        ]);
+        assert_eq!(
+            texts(&ruled.tables[0]),
+            [
+                ["Activity", "Central", "Range", "Basis"],
+                ["verify", "15s", "10-20", "medians"],
+                ["check", "35s", "35-74", "mean"],
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_word_header_cell_is_not_split_into_columns() {
+        let ruled = booktabs(&[
+            (
+                688.0,
+                &[("Item", 100.0), ("Total", 200.0), ("effort", 230.0)],
+            ),
+            (670.0, &[("a", 100.0), ("12", 200.0)]),
+            (656.0, &[("b", 100.0), ("7", 200.0)]),
+        ]);
+        assert_eq!(
+            texts(&ruled.tables[0]),
+            [["Item", "Totaleffort"], ["a", "12"], ["b", "7"]]
+        );
     }
 
     #[test]
@@ -881,6 +1335,35 @@ mod tests {
             true,
         );
         assert!(table.is_none());
+    }
+
+    #[test]
+    fn numbered_equations_are_not_a_table() {
+        let rows = rows(&[
+            &[("x=a+b", 120.0), ("(1)", 400.0)],
+            &[("y=c-d", 120.0), ("(2)", 400.0)],
+            &[("z=x*y", 120.0), ("(3a)", 400.0)],
+        ]);
+        assert!(aligned(&rows, 1.0, 0, true).is_none());
+        assert_eq!(
+            verdict(&rows, 1.0, 0, true).err(),
+            Some(Rejected::Equations)
+        );
+    }
+
+    #[test]
+    fn sparse_aligned_text_is_rejected_as_ambiguous() {
+        // Three columns line up, but only half the cells have text.
+        let rows = rows(&[
+            &[("Name", 72.0), ("Role", 200.0), ("Age", 320.0)],
+            &[("Ada", 72.0)],
+            &[("Grace", 72.0)],
+            &[("Alan", 72.0), ("Math", 200.0)],
+        ]);
+        assert!(aligned(&rows, 1.0, 0, false).is_none());
+        assert_eq!(verdict(&rows, 1.0, 0, false).err(), Some(Rejected::Sparse));
+        assert!(Rejected::Sparse.is_ambiguous());
+        assert!(!Rejected::Equations.is_ambiguous());
     }
 
     #[test]
